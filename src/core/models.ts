@@ -162,3 +162,26 @@ export function ensureMultiTrack(project: Project): Project {
     }),
   };
 }
+
+/** Blob URLs die after reload; missing: was written on Save */
+export function isPlayableMediaUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  if (url.startsWith("missing:")) return false;
+  if (url.startsWith("blob:")) return true; // valid only in current session
+  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("file:")) return true;
+  return false;
+}
+
+/** Mark dead blob/missing URLs so UI can ask for re-import without crashing playback */
+export function sanitizeMediaAssets(project: Project): Project {
+  return {
+    ...project,
+    mediaAssets: project.mediaAssets.map((a) => {
+      if (!a.localPathOrUrl || a.localPathOrUrl.startsWith("blob:")) {
+        // After reload all blobs are dead — mark for re-import
+        return { ...a, localPathOrUrl: `missing:${a.name}` };
+      }
+      return a;
+    }),
+  };
+}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createEmptyProject,
   ensureMultiTrack,
+  isPlayableMediaUrl,
   type Project,
   type ProjectEditProposal,
   type MediaAsset,
@@ -36,6 +37,8 @@ export function App() {
   const [pendingProposal, setPendingProposal] = useState<ProjectEditProposal | null>(null);
   const [playError, setPlayError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [isRendering, setIsRendering] = useState(false);
+  const [renderProgress, setRenderProgress] = useState(0);
 
   const dragRef = useRef<{
     clipId: string;
@@ -84,7 +87,9 @@ export function App() {
 
   const activeVideoAsset = useMemo(() => {
     if (!activeVideoClip?.mediaAssetId) return null;
-    return project.mediaAssets.find((a) => a.id === activeVideoClip.mediaAssetId) ?? null;
+    const a = project.mediaAssets.find((x) => x.id === activeVideoClip.mediaAssetId) ?? null;
+    if (!a || !isPlayableMediaUrl(a.localPathOrUrl)) return null;
+    return a;
   }, [activeVideoClip, project.mediaAssets]);
 
   // Active audio clip per audio track
@@ -98,7 +103,9 @@ export function App() {
   const audioAssetsForTracks = useMemo(() => {
     return activeAudioClips.map(({ clip }) => {
       if (!clip?.mediaAssetId) return null;
-      return project.mediaAssets.find((a) => a.id === clip.mediaAssetId) ?? null;
+      const a = project.mediaAssets.find((x) => x.id === clip.mediaAssetId) ?? null;
+      if (!a || !isPlayableMediaUrl(a.localPathOrUrl)) return null;
+      return a;
     });
   }, [activeAudioClips, project.mediaAssets]);
 
@@ -289,11 +296,12 @@ export function App() {
   const handleImport = useCallback(
     async (files: FileList | null) => {
       if (!files?.length) return;
-      const file = files[0];
+      for (let fi = 0; fi < files.length; fi++) {
+      const file = files[fi];
       const url = URL.createObjectURL(file);
       const isVideo = file.type.startsWith("video/");
       const isAudio = file.type.startsWith("audio/");
-      if (!isVideo && !isAudio) return;
+      if (!isVideo && !isAudio) continue;
 
       let durationMs = 5000;
       if (isVideo) {
@@ -333,7 +341,24 @@ export function App() {
 
       setProject((p) => {
         const kind = isVideo ? "VIDEO" : "AUDIO";
-        // Prefer selected target track if matching kind, else first free / first of kind
+        // Re-link: same filename was orphaned after reload
+        const orphan = p.mediaAssets.find(
+          (a) =>
+            a.name === file.name &&
+            (a.localPathOrUrl.startsWith("missing:") || !isPlayableMediaUrl(a.localPathOrUrl))
+        );
+        if (orphan) {
+          flash(`Re-linked ${file.name}`);
+          return {
+            ...p,
+            mediaAssets: p.mediaAssets.map((a) =>
+              a.id === orphan.id
+                ? { ...a, localPathOrUrl: url, durationMs, type: asset.type }
+                : a
+            ),
+          };
+        }
+
         let track =
           p.tracks.find((t) => t.id === targetTrackId && t.kind === kind) ??
           p.tracks.find((t) => t.kind === kind && t.clips.length === 0) ??
@@ -364,7 +389,8 @@ export function App() {
       setSelectedAssetId(asset.id);
       setIsPlaying(false);
       setPlayError(null);
-      flash(`Imported ${file.name}`);
+      } // end multi-file loop
+      flash(`Imported ${files.length} file(s)`);
     },
     [targetTrackId]
   );
@@ -428,6 +454,151 @@ export function App() {
     },
     [project]
   );
+
+  /** Real media export: record mixed video (top track) + audio tracks → WebM */
+  const renderComposition = useCallback(async () => {
+    if (isRendering) return;
+    if (project.durationMs < 200) {
+      flash("Nothing to render — add clips first");
+      return;
+    }
+
+    setIsRendering(true);
+    setRenderProgress(0);
+    setPlayError(null);
+    stopPlayback();
+    seekTo(0);
+
+    // Let seek settle
+    await new Promise((r) => setTimeout(r, 120));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 1280;
+    canvas.height = 720;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      setIsRendering(false);
+      flash("Canvas not available");
+      return;
+    }
+
+    const canvasStream = canvas.captureStream(30);
+    const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+
+    // Prefer element.captureStream for audio (no single-use WebAudio node limit)
+    const captureAudio = (el: HTMLAudioElement | null) => {
+      if (!el || !el.src) return;
+      try {
+        const anyEl = el as HTMLAudioElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream };
+        const s = anyEl.captureStream?.() || anyEl.mozCaptureStream?.();
+        if (s) for (const t of s.getAudioTracks()) tracks.push(t);
+      } catch (e) {
+        console.warn("[render] audio captureStream failed", e);
+      }
+    };
+    captureAudio(audio1Ref.current);
+    captureAudio(audio2Ref.current);
+
+    const combined = new MediaStream(tracks);
+    const mimeCandidates = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm",
+    ];
+    const mime = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || "video/webm";
+    const chunks: BlobPart[] = [];
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(combined, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
+    } catch {
+      recorder = new MediaRecorder(combined);
+    }
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data.size) chunks.push(ev.data);
+    };
+
+    const done = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => {
+        resolve(new Blob(chunks, { type: mime }));
+      };
+    });
+
+    recorder.start(200);
+
+    // Draw loop
+    let drawing = true;
+    const draw = () => {
+      if (!drawing) return;
+      const v = videoRef.current;
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (v && v.readyState >= 2 && v.videoWidth > 0) {
+        const scale = Math.min(canvas.width / v.videoWidth, canvas.height / v.videoHeight);
+        const w = v.videoWidth * scale;
+        const h = v.videoHeight * scale;
+        const x = (canvas.width - w) / 2;
+        const y = (canvas.height - h) / 2;
+        ctx.drawImage(v, x, y, w, h);
+      }
+      requestAnimationFrame(draw);
+    };
+    draw();
+
+    // Progress from playhead
+    const total = project.durationMs;
+    const progressTimer = window.setInterval(() => {
+      setProject((p) => {
+        setRenderProgress(Math.min(99, Math.round((p.playheadMs / total) * 100)));
+        return p;
+      });
+    }, 200);
+
+    await startPlayback();
+
+    // Wait until playback ends (playhead hits duration or isPlaying false)
+    await new Promise<void>((resolve) => {
+      const start = performance.now();
+      const maxWait = total + 5000;
+      const check = () => {
+        setProject((p) => {
+          if (p.playheadMs >= total - 50 || performance.now() - start > maxWait) {
+            resolve();
+          } else {
+            requestAnimationFrame(check);
+          }
+          return p;
+        });
+      };
+      // simpler: fixed duration wait based on timeline length
+      setTimeout(() => resolve(), total + 400);
+    });
+
+    stopPlayback();
+    drawing = false;
+    window.clearInterval(progressTimer);
+
+    if (recorder.state !== "inactive") recorder.stop();
+    const blob = await done;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(project.name || "resonance").replace(/\s+/g, "_")}_render.webm`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+    setRenderProgress(100);
+    setIsRendering(false);
+    flash("Export ready — WebM downloaded");
+  }, [
+    isRendering,
+    project.durationMs,
+    project.name,
+    stopPlayback,
+    seekTo,
+    startPlayback,
+  ]);
 
   const openProjectFile = useCallback(async (files: FileList | null) => {
     if (!files?.length) return;
@@ -493,6 +664,28 @@ export function App() {
       window.removeEventListener("pointerup", onUp);
     };
   }, [duration]);
+
+
+  const addMarkerAtPlayhead = useCallback(() => {
+    const ph = project.playheadMs;
+    const id = crypto.randomUUID();
+    setProject((p) => ({
+      ...p,
+      markers: [
+        ...p.markers,
+        { id, timeMs: ph, label: `M${p.markers.filter(m=>m.kind!=="beat").length + 1}`, kind: "cut" as const },
+      ],
+    }));
+    flash(`Marker at ${formatTime(ph)}`);
+  }, [project.playheadMs]);
+
+  const clearMarkers = useCallback(() => {
+    setProject((p) => ({
+      ...p,
+      markers: p.markers.filter((m) => m.kind === "beat"),
+    }));
+    flash("Markers cleared");
+  }, []);
 
   // ---------- SPLIT / DELETE ----------
   const splitAtPlayhead = useCallback(() => {
@@ -602,6 +795,10 @@ export function App() {
         e.preventDefault();
         splitAtPlayhead();
       }
+      if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        addMarkerAtPlayhead();
+      }
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
         deleteSelectedClip();
@@ -613,7 +810,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject]);
+  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject, addMarkerAtPlayhead]);
 
   return (
     <div className="app">
@@ -635,10 +832,11 @@ export function App() {
           }}>New</button>
           <button type="button" onClick={() => openInputRef.current?.click()}>Open</button>
           <button type="button" onClick={() => downloadProject()}>Save</button>
-          <button type="button" onClick={() => downloadProject(
-            `${(project.name || "export").replace(/\s+/g, "_")}_export.resonance.json`
-          )}>Export</button>
+          <button type="button" onClick={() => void renderComposition()} disabled={isRendering}>
+            {isRendering ? `Render ${renderProgress}%` : "Export"}
+          </button>
           <button type="button" onClick={splitAtPlayhead} title="C">Cut</button>
+          <button type="button" onClick={addMarkerAtPlayhead} title="M — marker at playhead">Marker</button>
           <button type="button" onClick={deleteSelectedClip}>Delete</button>
         </nav>
         <input
@@ -667,11 +865,59 @@ export function App() {
               key={a.id}
               className={`media-item ${selectedAssetId === a.id ? "selected" : ""}`}
               onClick={() => setSelectedAssetId(a.id)}
-              onDoubleClick={() => addAssetToTimeline(a.id)}
-              title="Double-click → place at playhead on target track"
+              onDoubleClick={() => {
+                if (isPlayableMediaUrl(a.localPathOrUrl)) addAssetToTimeline(a.id);
+              }}
+              title="Double-click → place at playhead"
             >
               <div className="name">{a.name}</div>
-              <div className="meta">{a.type} · {formatTime(a.durationMs)}</div>
+              <div className="meta">
+                {a.type} · {formatTime(a.durationMs)}
+                {!isPlayableMediaUrl(a.localPathOrUrl) && (
+                  <span style={{ color: "#f86", marginLeft: 6 }}>· missing</span>
+                )}
+              </div>
+              {!isPlayableMediaUrl(a.localPathOrUrl) && (
+                <button
+                  type="button"
+                  style={{
+                    marginTop: 6, width: "100%", fontSize: 11, padding: "4px 6px",
+                    borderRadius: 4, border: "1px solid #a53", background: "#2a1810",
+                    color: "#fca", cursor: "pointer",
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = a.type === "video" ? "video/*" : "audio/*";
+                    input.onchange = () => {
+                      if (input.files?.length) {
+                        // force name match path: temporarily rename expectation
+                        const f = input.files[0];
+                        // If names differ, still relink this asset id
+                        const url = URL.createObjectURL(f);
+                        setProject((p) => ({
+                          ...p,
+                          mediaAssets: p.mediaAssets.map((x) =>
+                            x.id === a.id
+                              ? {
+                                  ...x,
+                                  name: f.name,
+                                  localPathOrUrl: url,
+                                  durationMs: x.durationMs,
+                                }
+                              : x
+                          ),
+                        }));
+                        flash(`Re-linked → ${f.name}`);
+                      }
+                    };
+                    input.click();
+                  }}
+                >
+                  Re-import…
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -684,6 +930,7 @@ export function App() {
               id="file-input"
               type="file"
               accept="audio/*,video/*"
+              multiple
               hidden
               onChange={(e) => handleImport(e.target.files)}
             />
@@ -757,7 +1004,11 @@ export function App() {
             <div className="placeholder">
               <div style={{ fontSize: 16, marginBottom: 8 }}>Main Output</div>
               <span className="muted">
-                {hasAnyAudio ? "Audio only at playhead" : "Import & place media on V1/V2"}
+                {activeVideoClip && !activeVideoAsset
+                  ? "Media missing — re-import the file (same name relinks clips)"
+                  : hasAnyAudio
+                    ? "Audio only at playhead"
+                    : "Import & place media on V1/V2"}
               </span>
             </div>
           )}
@@ -795,6 +1046,22 @@ export function App() {
             borderRadius: 6, fontSize: 12, zIndex: 5,
           }}>{playError}</div>
         )}
+        {isRendering && (
+          <div style={{
+            position: "absolute", inset: 0, background: "rgba(0,0,0,0.72)",
+            display: "flex", flexDirection: "column", alignItems: "center",
+            justifyContent: "center", zIndex: 20, gap: 12,
+          }}>
+            <div style={{ fontSize: 16 }}>Rendering composition…</div>
+            <div style={{ width: 240, height: 6, background: "#333", borderRadius: 3 }}>
+              <div style={{
+                width: `${renderProgress}%`, height: "100%",
+                background: "#4af", borderRadius: 3, transition: "width 0.2s",
+              }} />
+            </div>
+            <div className="muted" style={{ fontSize: 12 }}>{renderProgress}% — WebM export</div>
+          </div>
+        )}
       </main>
 
       <aside className="inspector">
@@ -815,9 +1082,9 @@ export function App() {
         ) : (
           <p className="muted" style={{ marginBottom: 16, lineHeight: 1.55, fontSize: 12 }}>
             <strong>Shortcuts</strong><br />
-            Space Play/Pause · C Cut · Del Delete<br />
-            Ctrl+S Save · Drag clips to move<br />
-            V2 overlays V1 at playhead (crossover)
+            Space Play/Pause · C Cut · M Marker · Del Delete<br />
+            Ctrl+S Save · Multi-import supported<br />
+            V2 overlays V1 · Re-import restores media
           </p>
         )}
         {selectedClipId && (
@@ -841,13 +1108,24 @@ export function App() {
       </aside>
 
       <section className="timeline">
-        <div className="timeline-ruler" onClick={onTimelineClick} style={{ cursor: "pointer" }}>
-          {[0, 0.25, 0.5, 0.75, 1].map((p) => (
-            <span key={p} style={{
-              position: "absolute", left: `${p * 100}%`, transform: "translateX(-50%)",
-              top: 4, pointerEvents: "none",
-            }}>{formatTime(p * duration)}</span>
-          ))}
+        <div className="timeline-ruler-row">
+          <div className="timeline-ruler-gutter" />
+          <div className="timeline-ruler" onClick={onTimelineClick} style={{ cursor: "pointer" }}>
+            {[0, 0.25, 0.5, 0.75, 1].map((p) => (
+              <span key={p} style={{
+                position: "absolute", left: `${p * 100}%`, transform: "translateX(-50%)",
+                top: 4, pointerEvents: "none",
+              }}>{formatTime(p * duration)}</span>
+            ))}
+            {project.markers.filter((m) => m.kind !== "beat").map((m) => (
+              <div
+                key={m.id}
+                className="timeline-marker"
+                data-label={m.label}
+                style={{ left: `${Math.min(100, (m.timeMs / duration) * 100)}%` }}
+              />
+            ))}
+          </div>
         </div>
         <div className="timeline-tracks">
           {project.tracks.map((track, idx) => (

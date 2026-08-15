@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 1421,
-    strictPort: true,
+    // if 1421 is busy, use next free port instead of crashing
+    strictPort: false,
   },
 });

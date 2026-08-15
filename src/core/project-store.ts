@@ -1,10 +1,10 @@
 /**
- * Local-first project persistence (V0.1.1).
- * Uses localStorage. Later: Tauri fs + optional Vault memory on accept.
+ * Local-first project persistence (V0.1.2).
+ * Uses localStorage. Blob URLs cannot survive reload — sanitized on load.
  */
 
 import type { Project } from "./models";
-import { createEmptyProject, ensureMultiTrack } from "./models";
+import { createEmptyProject, ensureMultiTrack, sanitizeMediaAssets } from "./models";
 
 const KEY = "ailexsi-resonance-studio-project-v0.1";
 
@@ -14,7 +14,7 @@ export function loadProject(): Project {
     if (!raw) return createEmptyProject();
     const parsed = JSON.parse(raw) as Project;
     if (!parsed.id || !Array.isArray(parsed.tracks)) return createEmptyProject();
-    return ensureMultiTrack(parsed);
+    return sanitizeMediaAssets(ensureMultiTrack(parsed));
   } catch {
     return createEmptyProject();
   }
