@@ -1,30 +1,40 @@
 {
   "name": "@ailexsi/resonance-studio",
-  "version": "0.1.1",
+  "version": "4.0.1",
   "private": true,
   "type": "module",
-  "description": "AILEXSI Resonance Studio \u2014 local-first creative product. Consumes ailexsi-core-vault-v2 as immutable foundation.",
+  "description": "AILEXSI Resonance Studio Suite — local-first multi-track NLE. Browser WebCodecs MP4 + optional Tauri desktop.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "desktop": "tauri dev"
   },
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "mediabunny": "1.54.0",
+    "@tauri-apps/api": "1.5.6"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
+    "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.10",
-    "vitest": "^2.1.4"
+    "vite": "5.4.21",
+    "vitest": "^2.1.9",
+    "@tauri-apps/cli": "^1.5.14"
   },
   "engines": {
     "node": ">=20"
+  },
+  "overrides": {
+    "esbuild": "^0.25.0"
   }
 }

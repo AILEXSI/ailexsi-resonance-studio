@@ -1,50 +1,106 @@
-# AILEXSI Resonance Studio
+# AILEXSI Resonance Studio Suite V4.01
 
-**Local-first creative product** for Music + Video + Voice + Lyrics + Motion + Timing + AI + Memory.
+Local-first multi-track video/audio editor (NLE).
 
-`ailexsi-core-vault-v2` remains the **immutable foundation**. This product **consumes** it via `vault-adapter/` — never modifies Core/Vault packages.
+**Logo:** `AILEXSI Resonance Studio Suite V4.01`  
+**Repo:** https://github.com/AILEXSI/ailexsi-resonance-studio  
+**Dev server:** `http://localhost:1421`
 
-## V0.1.1 Vertical Slice
+## Quick start (Windows)
 
-- Import audio + video
-- **Multi-track timeline**: V1, V2, A1, A2 (crossover cuts)
-- Playback with top-video priority (V2 over V1)
-- Dual audio tracks
-- Drag clips · Cut at playhead (C) · Delete
-- **Save / Open / Export** project as `.resonance.json`
-- AI command bar (rule-based proposals · Accept/Reject)
-- Local vault stub (honest — no fake cloud)
-
-### Run
-
-```bash
+```powershell
+git clone https://github.com/AILEXSI/ailexsi-resonance-studio.git
+cd ailexsi-resonance-studio
 npm install
 npm run dev
 ```
 
-Open http://localhost:1421
+Open **http://localhost:1421**
 
-### Shortcuts
+### Required packages
+
+| Package | Why |
+|---------|-----|
+| `mediabunny@1.54.0` | H.264/AAC MP4 via WebCodecs |
+| `@tauri-apps/api@1.5.6` | Optional desktop path (Vite must resolve imports) |
+| `vite@5.4.21` | Do **not** force-upgrade |
+
+**Never run** `npm audit fix --force` — it breaks Vite 5.
+
+## Shortcuts
 
 | Key | Action |
 |-----|--------|
-| Space | Play / Pause |
-| C | Cut at playhead |
-| Del | Delete selected clip |
-| Ctrl+S | Save project JSON |
+| **V** | Cut / razor at playhead |
+| **C** | unbound (Ctrl+C = copy) |
+| Space | Play / pause |
+| M | Marker |
+| Delete | Delete selected clip |
 
-### Workflow
+## Export architecture (important)
 
-1. **New** project
-2. **Import** media (targets V1/A1 by default; set target track in left panel)
-3. Place second video on **V2** for crossover
-4. Drag · Cut · Play
-5. **Save** / **Export** `.resonance.json`
+```
+Timeline (V1/V2 + A1/A2)
+        │
+        ▼
+  jobFromProject()     src/core/exporter/from-project.ts
+        │
+        ▼
+  exportTimeline()     src/core/exporter/index.ts  (watchdog)
+        │
+        ▼
+  WebCodecs + Mediabunny   → real H.264 (+ AAC if available) MP4
+        │
+   success → download .mp4
+   failure → STOP (no silent WebM fallback)
+```
 
-### Philosophy
+- Browser: WebCodecs path only for “success”
+- MediaRecorder WebM is **not** a success path when WebCodecs exists
+- Desktop (optional): `npm run tauri:dev` + system `ffmpeg`
 
-> Your memory belongs to you.  
-> Your creative history belongs to you.  
-> Your style belongs to you.
+## Project layout
 
-AI proposes. Human decides.
+```
+src/
+  App.tsx                 UI + timeline + export dialog + shortcuts
+  styles.css
+  main.tsx
+  core/
+    models.ts             Project / Track / Clip types
+    media-store.ts        IndexedDB blobs
+    project-store.ts      localStorage project JSON
+    tauri-export.ts       optional desktop save
+    exporter/
+      index.ts            public API + watchdog
+      from-project.ts     Studio project → ExportJob
+      planner.ts          timeline segments
+      media.ts            video/audio load + seek cache
+      types.ts
+      backends/
+        webcodecs.ts      H.264/AAC MP4 (browser)
+        ffmpeg.ts         system ffmpeg (Node/desktop)
+        native.ts         future Rust stub
+```
+
+## Safe further development
+
+1. **One export path** — do not reintroduce silent MediaRecorder success after plugin failure.
+2. **Cut stays on V** — never bind bare C to cut.
+3. **Version in UI** — `APP_VERSION` in `App.tsx` + `package.json` version stay in sync.
+4. **Port 1421 only** when killing processes.
+5. **Vite 5.4.x** — pin it; no major bumps without a dedicated branch.
+6. **Blob media** — after reload, re-import if sources show `missing:`.
+
+## Next: V4.2
+
+Planned in a **new** repo (or branch) after this baseline is tagged:
+
+- Still-image frame painter
+- Stronger pre-export media hydration
+- Optional full removal of MediaRecorder code path
+- Architecture notes: see `ARCHITECTURE.md`
+
+## License
+
+UNLICENSED / AILEXSI private.
