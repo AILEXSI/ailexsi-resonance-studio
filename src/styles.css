@@ -43,7 +43,15 @@ html, body, #root { height: 100%; overflow: hidden; }
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
 }
-.topbar .logo { font-weight: 700; letter-spacing: 0.04em; color: var(--accent); }
+.topbar .logo { font-weight: 700; letter-spacing: 0.04em; color: var(--accent); display: inline-flex; align-items: baseline; gap: 8px; }
+.topbar .logo .version {
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
 .topbar nav { display: flex; gap: 4px; }
 .topbar button, .topbar .menu-item {
   background: transparent; border: none; color: var(--text-muted);
@@ -139,9 +147,11 @@ html, body, #root { height: 100%; overflow: hidden; }
   grid-row: 3; grid-column: 1 / -1;
   background: var(--bg-panel); border-top: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: hidden;
+  position: relative; z-index: 5;
+  min-height: 0;
 }
 .timeline-body {
-  flex: 1; display: grid; grid-template-columns: 100px 1fr; min-height: 0;
+  flex: 1; display: grid; grid-template-columns: 100px 1fr 52px; min-height: 0;
 }
 .timeline-labels {
   display: flex; flex-direction: column; border-right: 1px solid var(--border);
@@ -163,9 +173,43 @@ html, body, #root { height: 100%; overflow: hidden; }
   position: relative; display: flex; flex-direction: column; min-width: 0; overflow: hidden;
 }
 .timeline-ruler {
-  height: 22px; flex-shrink: 0; position: relative;
+  height: 28px; flex-shrink: 0; position: relative;
   background: var(--bg-elevated); border-bottom: 1px solid var(--border);
-  font-size: 10px; color: var(--text-muted); cursor: pointer;
+  font-size: 10px; color: var(--text-muted); cursor: crosshair;
+  overflow: hidden;
+}
+.ruler-tick {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  background: #4a5568;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+.ruler-tick.major {
+  height: 12px;
+  background: #8b93a7;
+}
+.ruler-tick.minor {
+  height: 6px;
+  background: #3a4250;
+}
+.ruler-label {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font-size: 9px;
+  color: var(--text-muted);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.ruler-zoom-badge {
+  position: absolute;
+  right: 6px;
+  top: 2px;
+  font-size: 9px;
+  color: #6af;
+  pointer-events: none;
 }
 .timeline-tracks {
   flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; min-height: 0;
@@ -229,3 +273,130 @@ html, body, #root { height: 100%; overflow: hidden; }
 .badge.pending { background: var(--accent-dim); }
 .badge.accepted { background: var(--success); color: #000; }
 .badge.rejected { background: var(--danger); }
+
+
+/* Master out strip (right of timeline) */
+.master-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 4px 6px;
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border);
+  min-height: 0;
+}
+.master-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding-top: 2px;
+}
+.master-meter {
+  flex: 1;
+  width: 10px;
+  min-height: 48px;
+  background: #0a0c0f;
+  border-radius: 3px;
+  border: 1px solid #333;
+  position: relative;
+  overflow: hidden;
+}
+.master-meter-fill {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  transition: height 0.05s linear;
+  border-radius: 2px;
+}
+.master-fader {
+  width: 36px;
+  height: 72px;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  accent-color: #5b8def;
+  cursor: pointer;
+}
+.master-pct {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* Cubase-style loop / cycle range */
+.loop-region {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(62, 207, 142, 0.14);
+  border-left: 2px solid #3ecf8e;
+  border-right: 2px solid #f5a623;
+  pointer-events: none;
+  z-index: 2;
+}
+.loop-flag {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  z-index: 14;
+  pointer-events: none;
+}
+.loop-flag.in { background: #3ecf8e; box-shadow: 0 0 8px rgba(62, 207, 142, 0.6); }
+.loop-flag.out { background: #f5a623; box-shadow: 0 0 8px rgba(245, 166, 35, 0.6); }
+.loop-flag-label {
+  position: absolute;
+  top: 2px;
+  left: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  pointer-events: none;
+}
+.loop-flag.in .loop-flag-label {
+  background: #3ecf8e;
+  color: #04140c;
+}
+.loop-flag.out .loop-flag-label {
+  background: #f5a623;
+  color: #1a1200;
+  left: auto;
+  right: 5px;
+}
+.loop-flag.in::before {
+  border-top-color: #3ecf8e;
+  border-left-color: #3ecf8e;
+}
+.loop-flag.out::before {
+  border-top-color: #f5a623;
+  border-right-color: #f5a623;
+  left: -6px;
+}
+
+
+.clip-wave {
+  position: absolute;
+  inset: 2px 2px 2px 2px;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  opacity: 0.85;
+  pointer-events: none;
+}
+.clip-wave span {
+  flex: 1;
+  min-width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: 1px 1px 0 0;
+}
+.clip-label {
+  position: relative;
+  z-index: 1;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+}
+.clip.AUDIO {
+  overflow: hidden;
+}

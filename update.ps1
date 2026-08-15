@@ -1,32 +1,18 @@
-# AILEXSI Resonance Studio — update & clean start
-$ErrorActionPreference = "Continue"
-Set-Location $PSScriptRoot
-
-Write-Host "==> git pull" -ForegroundColor Cyan
-git pull origin main
-
-Write-Host "==> free port 1421" -ForegroundColor Cyan
-try {
-  $conns = Get-NetTCPConnection -LocalPort 1421 -ErrorAction SilentlyContinue
-  if ($conns) {
-    $conns | ForEach-Object {
-      Write-Host "    killing PID $($_.OwningProcess)"
-      Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
-    }
-  } else {
-    Write-Host "    port 1421 is free"
-  }
-} catch {
-  # fallback
-  npx --yes kill-port 1421 2>$null
+# Apply ResonanceStudio zip into this folder
+$ErrorActionPreference = "Stop"
+$Target = $PSScriptRoot
+$z = Get-ChildItem "$env:USERPROFILE\Downloads\ResonanceStudio-V*.zip" |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $z) { Write-Host "No ResonanceStudio-V*.zip in Downloads"; exit 1 }
+Write-Host "Applying $($z.Name)"
+Get-NetTCPConnection -LocalPort 1421 -EA SilentlyContinue | % { Stop-Process -Id $_.OwningProcess -Force -EA SilentlyContinue }
+$temp = Join-Path $env:TEMP ("rs-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+Expand-Archive $z.FullName $temp -Force
+$root = $temp
+if (Test-Path "$temp\ailexsi-resonance-studio") { $root = "$temp\ailexsi-resonance-studio" }
+Get-ChildItem $root -Force | Where-Object { $_.Name -notin @('.env','.git','node_modules','src-tauri\target') } | ForEach-Object {
+  Copy-Item $_.FullName (Join-Path $Target $_.Name) -Recurse -Force
 }
-
-Write-Host "==> npm install" -ForegroundColor Cyan
+Set-Location $Target
 npm install
-
-Write-Host "==> npm audit fix (safe, no --force)" -ForegroundColor Cyan
-npm audit fix 2>$null
-
-Write-Host ""
-Write-Host "Fertig. Starte mit:  npm run dev" -ForegroundColor Green
-Write-Host "Browser: http://localhost:1421 (oder anderer Port laut Terminal)" -ForegroundColor Green
+Write-Host "Browser: npm run dev | Desktop MP4: npm run tauri:dev (needs Rust + ffmpeg)"

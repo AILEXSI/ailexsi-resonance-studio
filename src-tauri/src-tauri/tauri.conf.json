@@ -1,0 +1,66 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1421",
+    "distDir": "../dist",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "AILEXSI Resonance Studio",
+    "version": "0.3.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      },
+      "dialog": {
+        "all": false,
+        "save": true,
+        "open": true
+      },
+      "fs": {
+        "all": false,
+        "writeFile": true,
+        "readFile": true,
+        "scope": [
+          "$TEMP/**",
+          "$DOWNLOAD/**",
+          "$DOCUMENT/**",
+          "$DESKTOP/**",
+          "$HOME/**",
+          "$APP/**"
+        ]
+      },
+      "path": {
+        "all": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.ailexsi.resonance-studio",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/henry.w@example.net",
+        "icons/icon.png"
+      ]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "AILEXSI Resonance Studio",
+        "width": 1440,
+        "height": 900,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}

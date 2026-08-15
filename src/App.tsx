@@ -16,6 +16,10 @@ import {
   hydrateMediaAssets,
   clearAllMediaBlobs,
 } from "./core/media-store";
+import { extractWaveformPeaks } from "./core/waveform";
+import { isTauri, exportBlobToMp4 } from "./core/tauri-export";
+import { exportTimeline } from "./core/exporter";
+import { jobFromProject } from "./core/exporter/from-project";
 import { localOnlyVaultAdapter } from "./vault-adapter";
 
 function formatTime(ms: number): string {
@@ -32,8 +36,17 @@ function clipAt(track: Track, timeMs: number): Clip | null {
   );
 }
 
+const APP_VERSION = "4.01";
+
 export function App() {
-  const [project, setProject] = useState<Project>(() => ensureMultiTrack(loadProject()));
+  const [project, setProject] = useState<Project>(() => {
+    try {
+      return ensureMultiTrack(loadProject());
+    } catch (e) {
+      console.warn("[boot] loadProject failed", e);
+      return createEmptyProject("New Resonance");
+    }
+  });
   const [mediaReady, setMediaReady] = useState(false);
   const [showWelcome, setShowWelcome] = useState(false);
   const [command, setCommand] = useState("");
@@ -45,6 +58,15 @@ export function App() {
   const [clipClipboard, setClipClipboard] = useState<Clip | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [masterVolume, setMasterVolume] = useState(1);
+  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [viewStartMs, setViewStartMs] = useState(0);
+  const [loopInMs, setLoopInMs] = useState<number | null>(null);
+  const [loopOutMs, setLoopOutMs] = useState<number | null>(null);
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  const [rangeClickStep, setRangeClickStep] = useState<"in" | "out">("in");
+  const [undoStack, setUndoStack] = useState<Project[]>([]);
+  const [redoStack, setRedoStack] = useState<Project[]>([]);
+  const [snapEnabled, setSnapEnabled] = useState(true);
   const [meterLevel, setMeterLevel] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [pendingProposal, setPendingProposal] = useState<ProjectEditProposal | null>(null);
@@ -52,9 +74,37 @@ export function App() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState(0);
+  const [exportPhase, setExportPhase] = useState<"idle" | "recording" | "converting" | "saving">("idle");
+  const [desktopMp4Ready, setDesktopMp4Ready] = useState(false);
+  const exportLockRef = useRef(false);
   const [exportName, setExportName] = useState("");
   const [showExportDlg, setShowExportDlg] = useState(false);
   const cancelRenderRef = useRef(false);
+
+  const flash = (msg: string) => {
+    setStatusMsg(msg);
+    setTimeout(() => setStatusMsg(null), 2200);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!isTauri()) {
+        setDesktopMp4Ready(false);
+        return;
+      }
+      try {
+        const { checkFfmpeg } = await import("./core/tauri-export");
+        const path = await checkFfmpeg();
+        if (!cancelled) setDesktopMp4Ready(!!path);
+      } catch {
+        if (!cancelled) setDesktopMp4Ready(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const dragRef = useRef<{
     clipId: string;
@@ -112,12 +162,47 @@ export function App() {
   }
 
 
-  const flash = (msg: string) => {
-    setStatusMsg(msg);
-    setTimeout(() => setStatusMsg(null), 2200);
-  };
-
   const duration = Math.max(project.durationMs, 1000);
+  const viewDurationMs = Math.max(500, duration / timelineZoom);
+  const viewEndMs = Math.min(duration, viewStartMs + viewDurationMs);
+  // clamp view window
+  const clampedViewStart = Math.max(0, Math.min(viewStartMs, Math.max(0, duration - viewDurationMs)));
+  const msToPct = (ms: number) => ((ms - clampedViewStart) / viewDurationMs) * 100;
+  const pctToMs = (pct: number) => clampedViewStart + (pct / 100) * viewDurationMs;
+  const FRAME_MS = 1000 / 30;
+
+  const undo = useCallback(() => {
+    setUndoStack((stack) => {
+      if (!stack.length) {
+        flash("Nothing to undo");
+        return stack;
+      }
+      const prev = stack[stack.length - 1];
+      setProject((cur) => {
+        setRedoStack((r) => [...r, cur]);
+        return prev;
+      });
+      flash("Undo");
+      return stack.slice(0, -1);
+    });
+  }, []);
+
+  const redo = useCallback(() => {
+    setRedoStack((stack) => {
+      if (!stack.length) {
+        flash("Nothing to redo");
+        return stack;
+      }
+      const next = stack[stack.length - 1];
+      setProject((cur) => {
+        setUndoStack((u) => [...u, cur]);
+        return next;
+      });
+      flash("Redo");
+      return stack.slice(0, -1);
+    });
+  }, []);
+
 
   const videoTracks = useMemo(
     () => project.tracks.filter((t) => t.kind === "VIDEO"),
@@ -227,6 +312,7 @@ export function App() {
   // ---------- PLAYBACK ----------
   const startPlayback = useCallback(async () => {
     setPlayError(null);
+    try { ensureAudioGraph(); } catch { /* */ }
     const v = videoRef.current;
     if (v) v.muted = muteVideo;
 
@@ -280,18 +366,79 @@ export function App() {
     if (videoRef.current && !muteVideo) videoRef.current.volume = v;
   }, [masterVolume, muteVideo]);
 
-  // simple peak meter while playing
+  // Real peak meter via Web Audio AnalyserNode
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const sourcesWired = useRef(false);
+
+  const ensureAudioGraph = useCallback(() => {
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioContext();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") void ctx.resume();
+      if (!analyserRef.current) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.7;
+        analyser.connect(ctx.destination);
+        analyserRef.current = analyser;
+      }
+      if (!sourcesWired.current) {
+        const analyser = analyserRef.current!;
+        const els = [audio1Ref.current, audio2Ref.current].filter(Boolean) as HTMLAudioElement[];
+        for (const el of els) {
+          try {
+            const src = ctx.createMediaElementSource(el);
+            src.connect(analyser);
+          } catch {
+            // already wired
+          }
+        }
+        // video element audio path when not muted by dual-audio rule
+        if (videoRef.current && !muteVideo) {
+          try {
+            const src = ctx.createMediaElementSource(videoRef.current);
+            src.connect(analyser);
+          } catch {
+            /* already */
+          }
+        }
+        sourcesWired.current = true;
+      }
+    } catch (e) {
+      console.warn("[meter]", e);
+    }
+  }, [muteVideo]);
+
   useEffect(() => {
     if (!isPlaying) {
       setMeterLevel(0);
       return;
     }
-    const id = window.setInterval(() => {
-      // visual-only proxy meter from playhead motion
-      setMeterLevel(0.15 + Math.random() * 0.55 * masterVolume);
-    }, 80);
-    return () => window.clearInterval(id);
-  }, [isPlaying, masterVolume]);
+    ensureAudioGraph();
+    const analyser = analyserRef.current;
+    if (!analyser) {
+      // fallback visual if graph failed
+      const id = window.setInterval(() => {
+        setMeterLevel(0.1 + Math.random() * 0.4 * masterVolume);
+      }, 80);
+      return () => window.clearInterval(id);
+    }
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    let raf = 0;
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      const avg = sum / data.length / 255;
+      setMeterLevel(Math.min(1, avg * 1.8 * masterVolume));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlaying, masterVolume, ensureAudioGraph]);
 
   // rAF clock
   useEffect(() => {
@@ -349,6 +496,35 @@ export function App() {
           syncA(audio2Ref.current, aTracks[1]);
         }
 
+        if (loopEnabled && loopInMs != null && loopOutMs != null && next >= loopOutMs) {
+          const back = loopInMs;
+          // resync media to loop in
+          requestAnimationFrame(() => {
+            const v = videoRef.current;
+            const vTracks = p.tracks.filter((t) => t.kind === "VIDEO");
+            let clip: Clip | null = null;
+            for (let i = vTracks.length - 1; i >= 0; i--) {
+              const c = clipAt(vTracks[i], back);
+              if (c) { clip = c; break; }
+            }
+            if (v && clip?.sourceRange) {
+              const offset = back - clip.range.startMs;
+              try { v.currentTime = Math.max(0, (clip.sourceRange.startMs + offset) / 1000); } catch { /* */ }
+            }
+            const aTracks = p.tracks.filter((t) => t.kind === "AUDIO");
+            const syncA = (el: HTMLAudioElement | null, track: Track | undefined) => {
+              if (!el || !track) return;
+              const c = clipAt(track, back);
+              if (c?.sourceRange) {
+                const offset = back - c.range.startMs;
+                try { el.currentTime = Math.max(0, (c.sourceRange.startMs + offset) / 1000); } catch { /* */ }
+              }
+            };
+            syncA(audio1Ref.current, aTracks[0]);
+            syncA(audio2Ref.current, aTracks[1]);
+          });
+          return { ...p, playheadMs: back };
+        }
         if (next >= max) {
           videoRef.current?.pause();
           audio1Ref.current?.pause();
@@ -362,7 +538,7 @@ export function App() {
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isPlaying, duration]);
+  }, [isPlaying, duration, loopEnabled, loopInMs, loopOutMs]);
 
   // ---------- IMPORT ----------
   const handleImport = useCallback(
@@ -413,7 +589,7 @@ export function App() {
         localPathOrUrl: url,
         durationMs,
         analysis: isAudio
-          ? { waveformPeaks: Array.from({ length: 64 }, () => 0.25 + Math.random() * 0.7) }
+          ? { waveformPeaks: await extractWaveformPeaks(file, 128) }
           : { width: 0, height: 0 },
       };
 
@@ -544,81 +720,184 @@ export function App() {
   }, [stopPlayback]);
 
   const startExportWithName = useCallback(async (filename: string) => {
-    if (isRendering) return;
+    if (isRendering || exportLockRef.current) return;
     if (project.durationMs < 200) {
       flash("Nothing to render — add clips first");
       return;
     }
+    exportLockRef.current = true;
     const safeName = (filename || project.name || "resonance").replace(/[^\w\-]+/g, "_");
     cancelRenderRef.current = false;
     setShowExportDlg(false);
     setIsRendering(true);
+    setExportPhase("recording");
     setRenderProgress(0);
     setPlayError(null);
     stopPlayback();
-    seekTo(0);
 
-    // Let seek settle
-    await new Promise((r) => setTimeout(r, 120));
+    const rangeStart = loopInMs != null && loopOutMs != null ? loopInMs : 0;
+    const rangeEnd =
+      loopInMs != null && loopOutMs != null ? loopOutMs : project.durationMs;
+
+    // Plugin path: local H.264/AAC MP4 via @ailexsi/exporter (WebCodecs)
+    try {
+      setExportPhase("converting");
+      const job = jobFromProject(
+        {
+          id: project.id,
+          name: project.name,
+          durationMs: project.durationMs,
+          tracks: project.tracks,
+          mediaAssets: project.mediaAssets,
+        },
+        {
+          fileName: safeName,
+          rangeStartMs: rangeStart,
+          rangeEndMs: rangeEnd,
+        },
+      );
+      const result = await exportTimeline(job, {
+        onProgress: (p) => {
+          setRenderProgress(p.percent);
+          if (p.percent >= 90) setExportPhase("saving");
+        },
+      });
+      if (result.success && result.blob) {
+        const url = URL.createObjectURL(result.blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = result.outputPath.endsWith(".mp4")
+          ? result.outputPath
+          : `${safeName}.mp4`;
+        a.rel = "noopener";
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
+        setRenderProgress(100);
+        flash(
+          `MP4 ready · ${(result.fileSizeBytes / 1024 / 1024).toFixed(2)} MB · ${result.backend || "webcodecs"} · Downloads`,
+        );
+        setIsRendering(false);
+        setExportPhase("idle");
+        exportLockRef.current = false;
+        setTimeout(() => setRenderProgress(0), 1200);
+        return;
+      }
+      // Plugin ran but failed — do NOT fall through to MediaRecorder WebM.
+      const errMsg = result.error || "MP4 export failed";
+      if (errMsg !== "Export cancelled") {
+        flash(errMsg);
+        console.warn("[exporter plugin]", errMsg);
+      }
+      setIsRendering(false);
+      setExportPhase("idle");
+      exportLockRef.current = false;
+      setTimeout(() => setRenderProgress(0), 800);
+      return;
+    } catch (pluginErr) {
+      const msg = pluginErr instanceof Error ? pluginErr.message : String(pluginErr);
+      console.warn("[exporter plugin]", pluginErr);
+      const noWebCodecs =
+        typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined";
+      if (!noWebCodecs) {
+        flash(`MP4 export failed: ${msg}`);
+        setIsRendering(false);
+        setExportPhase("idle");
+        exportLockRef.current = false;
+        setTimeout(() => setRenderProgress(0), 800);
+        return;
+      }
+      flash("WebCodecs unavailable — MediaRecorder fallback…");
+    }
+
+    const rangeLen = Math.max(500, rangeEnd - rangeStart);
+    seekTo(rangeStart);
+    await new Promise((r) => setTimeout(r, 200));
 
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
-    const ctx = canvas.getContext("2d");
+    // must be in DOM for some browsers to emit captureStream frames
+    canvas.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) {
+      canvas.remove();
       setIsRendering(false);
+      setExportPhase("idle");
+      exportLockRef.current = false;
       flash("Canvas not available");
       return;
     }
 
-    const canvasStream = canvas.captureStream(30);
-    const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
-
-    // Prefer element.captureStream for audio (no single-use WebAudio node limit)
-    const captureAudio = (el: HTMLAudioElement | null) => {
-      if (!el || !el.src) return;
-      try {
-        const anyEl = el as HTMLAudioElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream };
-        const s = anyEl.captureStream?.() || anyEl.mozCaptureStream?.();
-        if (s) for (const t of s.getAudioTracks()) tracks.push(t);
-      } catch (e) {
-        console.warn("[render] audio captureStream failed", e);
-      }
-    };
-    captureAudio(audio1Ref.current);
-    captureAudio(audio2Ref.current);
-
-    const combined = new MediaStream(tracks);
+    // Prefer MP4 when browser supports recording it; else VP8 WebM → ffmpeg MP4.
     const mimeCandidates = [
-      "video/webm;codecs=vp9,opus",
+      "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      "video/mp4",
       "video/webm;codecs=vp8,opus",
+      "video/webm;codecs=vp8",
       "video/webm",
     ];
     const mime = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || "video/webm";
-    const chunks: BlobPart[] = [];
+
+    const canvasStream = canvas.captureStream(30);
+    const outTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+
+    const captureAudio = (el: HTMLMediaElement | null) => {
+      if (!el) return;
+      try {
+        const anyEl = el as HTMLMediaElement & {
+          captureStream?: () => MediaStream;
+          mozCaptureStream?: () => MediaStream;
+        };
+        const s = anyEl.captureStream?.() || anyEl.mozCaptureStream?.();
+        if (s) {
+          for (const t of s.getAudioTracks()) {
+            t.enabled = true;
+            outTracks.push(t);
+          }
+        }
+      } catch (e) {
+        console.warn("[render] audio capture failed", e);
+      }
+    };
+
+    // start media first so captureStream has signal
+    await startPlayback();
+    await new Promise((r) => setTimeout(r, 100));
+    captureAudio(audio1Ref.current);
+    captureAudio(audio2Ref.current);
+    // video element audio only if not muted by dual-audio path
+    if (videoRef.current && !videoRef.current.muted) {
+      captureAudio(videoRef.current);
+    }
+
+    const combined = new MediaStream(outTracks);
+    const chunks: Blob[] = [];
     let recorder: MediaRecorder;
     try {
-      recorder = new MediaRecorder(combined, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
+      recorder = new MediaRecorder(combined, {
+        mimeType: mime,
+        videoBitsPerSecond: 5_000_000,
+        audioBitsPerSecond: 192_000,
+      });
     } catch {
       recorder = new MediaRecorder(combined);
     }
 
     recorder.ondataavailable = (ev) => {
-      if (ev.data.size) chunks.push(ev.data);
+      if (ev.data && ev.data.size > 0) chunks.push(ev.data);
     };
 
-    const done = new Promise<Blob>((resolve) => {
-      recorder.onstop = () => {
-        resolve(new Blob(chunks, { type: mime }));
-      };
+    const stopped = new Promise<void>((resolve) => {
+      recorder.onstop = () => resolve();
+      recorder.onerror = () => resolve();
     });
 
-    recorder.start(200);
-
-    // Draw loop
-    let drawing = true;
-    const draw = () => {
-      if (!drawing) return;
+    // paint a few frames before record so first keyframe isn't empty
+    const paint = () => {
       const v = videoRef.current;
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -626,96 +905,190 @@ export function App() {
         const scale = Math.min(canvas.width / v.videoWidth, canvas.height / v.videoHeight);
         const w = v.videoWidth * scale;
         const h = v.videoHeight * scale;
-        const x = (canvas.width - w) / 2;
-        const y = (canvas.height - h) / 2;
-        ctx.drawImage(v, x, y, w, h);
+        ctx.drawImage(v, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
       }
-      requestAnimationFrame(draw);
     };
-    draw();
+    for (let i = 0; i < 5; i++) {
+      paint();
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+    }
 
-    // Progress from playhead
-    const total = project.durationMs;
+    recorder.start(250);
+
+    let drawing = true;
+    const drawLoop = () => {
+      if (!drawing) return;
+      paint();
+      requestAnimationFrame(drawLoop);
+    };
+    drawLoop();
+
     const progressTimer = window.setInterval(() => {
       setProject((p) => {
-        setRenderProgress(Math.min(99, Math.round((p.playheadMs / total) * 100)));
+        const pct = Math.min(90, Math.round(((p.playheadMs - rangeStart) / rangeLen) * 90));
+        setRenderProgress(Math.max(0, pct));
+        // auto-stop when playhead passes range end
+        if (p.playheadMs >= rangeEnd - 30) {
+          cancelRenderRef.current = false;
+        }
         return p;
       });
-    }, 200);
+    }, 100);
 
-    await startPlayback();
-
-    // Wait until end or cancel
+    // Wait until range length elapsed OR playhead past end OR cancel
     await new Promise<void>((resolve) => {
       const t0 = performance.now();
-      const tickWait = () => {
+      const tick = () => {
         if (cancelRenderRef.current) {
           resolve();
           return;
         }
-        if (performance.now() - t0 >= total + 400) {
+        const elapsed = performance.now() - t0;
+        // hard stop after range + buffer
+        if (elapsed >= rangeLen + 800) {
           resolve();
           return;
         }
-        requestAnimationFrame(tickWait);
+        requestAnimationFrame(tick);
       };
-      tickWait();
+      tick();
     });
 
-    stopPlayback();
     drawing = false;
     window.clearInterval(progressTimer);
+    stopPlayback();
 
-    if (cancelRenderRef.current) {
-      try { if (recorder.state !== "inactive") recorder.stop(); } catch { /* */ }
+    const wasCancelled = cancelRenderRef.current;
+
+    try {
+      if (recorder.state === "recording") {
+        try {
+          recorder.requestData();
+        } catch { /* */ }
+        recorder.stop();
+      }
+    } catch { /* */ }
+
+    // recorder.onstop can hang forever in Chrome — hard cap
+    await Promise.race([
+      stopped,
+      new Promise<void>((r) => setTimeout(r, 2500)),
+    ]);
+    await new Promise((r) => setTimeout(r, 80));
+
+    // cleanup stream tracks + canvas
+    for (const t of outTracks) {
+      try {
+        t.stop();
+      } catch {
+        /* */
+      }
+    }
+    try {
+      canvas.remove();
+    } catch {
+      /* */
+    }
+
+    const finishUi = () => {
       setIsRendering(false);
+      setExportPhase("idle");
+      exportLockRef.current = false;
+      setTimeout(() => setRenderProgress(0), 1200);
+    };
+
+    if (wasCancelled || cancelRenderRef.current) {
+      setRenderProgress(0);
+      finishUi();
+      flash("Export cancelled — no file written");
       return;
     }
 
-    if (recorder.state !== "inactive") recorder.stop();
-    const blob = await done;
-
-    const outName = `${safeName}.webm`;
-    // Prefer system save dialog when available
-    try {
-      const w = window as Window & {
-        showSaveFilePicker?: (opts: unknown) => Promise<FileSystemFileHandle>;
-      };
-      if (typeof w.showSaveFilePicker === "function") {
-        const handle = await w.showSaveFilePicker({
-          suggestedName: outName,
-          types: [{ description: "WebM video", accept: { "video/webm": [".webm"] } }],
-        });
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        flash(`Exported → ${handle.name}`);
-      } else {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = outName;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 5000);
-        flash(`Exported → ${outName}`);
-      }
-    } catch (e: unknown) {
-      // user aborted picker
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/abort/i.test(msg)) {
-        flash("Export save cancelled");
-      } else {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = outName;
-        a.click();
-        flash(`Exported → ${outName}`);
-      }
+    const rawBlob = new Blob(chunks, {
+      type: mime.includes("webm") ? "video/webm" : mime.includes("mp4") ? "video/mp4" : "video/webm",
+    });
+    if (rawBlob.size < 8_000) {
+      setRenderProgress(0);
+      finishUi();
+      flash(`Export too small (${rawBlob.size} B) — try again with media visible`);
+      return;
     }
 
-    setRenderProgress(100);
-    setIsRendering(false);
+    setExportPhase("saving");
+    setRenderProgress(95);
+
+    try {
+      // Desktop (Tauri): native ffmpeg → real H.264 MP4
+      if (isTauri()) {
+        try {
+          const { path, message } = await exportBlobToMp4(rawBlob, safeName);
+          setRenderProgress(100);
+          flash(message || `MP4 saved: ${path}`);
+        } catch (te) {
+          console.warn("[export] Tauri MP4 failed, falling back to WebM", te);
+          flash(`MP4 fehlgeschlagen: ${String((te as Error)?.message || te).slice(0, 100)}`);
+          const url = URL.createObjectURL(rawBlob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${safeName}.webm`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 8000);
+          setRenderProgress(100);
+        }
+      } else {
+        // Browser: WebM (or native MP4 if MediaRecorder produced it)
+        const isMp4 = mime.includes("mp4") || rawBlob.type.includes("mp4");
+        const outName = `${safeName}.${isMp4 ? "mp4" : "webm"}`;
+        const accept = isMp4
+          ? ({ "video/mp4": [".mp4"] } as Record<string, string[]>)
+          : ({ "video/webm": [".webm"] } as Record<string, string[]>);
+        const desc = isMp4 ? "MP4 video" : "WebM video";
+        const w = window as Window & {
+          showSaveFilePicker?: (opts: unknown) => Promise<FileSystemFileHandle>;
+        };
+        if (typeof w.showSaveFilePicker === "function") {
+          try {
+            const handle = await w.showSaveFilePicker({
+              suggestedName: outName,
+              types: [{ description: desc, accept }],
+            });
+            const writable = await handle.createWritable();
+            await writable.write(rawBlob);
+            await writable.close();
+          } catch (pickErr) {
+            if ((pickErr as Error)?.name === "AbortError") {
+              setRenderProgress(0);
+              finishUi();
+              flash("Save cancelled");
+              return;
+            }
+            const url = URL.createObjectURL(rawBlob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = outName;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 8000);
+          }
+        } else {
+          const url = URL.createObjectURL(rawBlob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = outName;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 8000);
+        }
+        setRenderProgress(100);
+        flash(
+          `Exported ${outName} (${(rawBlob.size / 1024 / 1024).toFixed(1)} MB)` +
+            (isMp4 ? "" : " — WebM (Browser). MP4: npm run tauri:dev + ffmpeg, oder convert-webm-to-mp4.ps1")
+        );
+      }
+    } catch (e) {
+      console.warn("[export] save error", e);
+      flash("Export failed to save file");
+    } finally {
+      finishUi();
+    }
   }, [
     isRendering,
     project.durationMs,
@@ -723,13 +1096,14 @@ export function App() {
     stopPlayback,
     seekTo,
     startPlayback,
+    loopInMs,
+    loopOutMs,
   ]);
 
   const openExportDialog = useCallback(() => {
-    if (isRendering) return;
-    setExportName(`${(project.name || "resonance").replace(/\s+/g, "_")}_render`);
+    setExportName((project.name || "resonance").replace(/\s+/g, "_") + "_render");
     setShowExportDlg(true);
-  }, [isRendering, project.name]);
+  }, [project.name]);
 
   const renderComposition = useCallback(() => {
     openExportDialog();
@@ -757,6 +1131,49 @@ export function App() {
   }, [stopPlayback]);
 
   // ---------- CLIP DRAG ----------
+
+  const zoomIn = useCallback(() => {
+    setTimelineZoom((z) => Math.min(64, z * 1.5));
+  }, []);
+  const zoomOut = useCallback(() => {
+    setTimelineZoom((z) => {
+      const next = Math.max(1, z / 1.5);
+      if (next <= 1.05) {
+        setViewStartMs(0);
+        return 1;
+      }
+      return next;
+    });
+  }, []);
+  const zoomFit = useCallback(() => {
+    setTimelineZoom(1);
+    setViewStartMs(0);
+  }, []);
+  const zoomAroundPlayhead = useCallback((factor: number) => {
+    setTimelineZoom((z) => {
+      const next = Math.min(64, Math.max(1, z * factor));
+      const vd = Math.max(500, duration / next);
+      const center = project.playheadMs;
+      setViewStartMs(Math.max(0, Math.min(duration - vd, center - vd / 2)));
+      return next;
+    });
+  }, [duration, project.playheadMs]);
+
+  const stepFrame = useCallback((dir: -1 | 1) => {
+    stopPlayback();
+    const next = Math.max(0, Math.min(duration, project.playheadMs + dir * FRAME_MS));
+    seekTo(next);
+  }, [duration, project.playheadMs, seekTo, stopPlayback]);
+
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+  const zoomRef = useRef(timelineZoom);
+  zoomRef.current = timelineZoom;
+  const snapRef = useRef(snapEnabled);
+  snapRef.current = snapEnabled;
+  const tracksRef = useRef(project.tracks);
+  tracksRef.current = project.tracks;
+
   const onClipPointerDown = useCallback((e: React.PointerEvent, clip: Clip) => {
     e.stopPropagation();
     e.preventDefault();
@@ -765,47 +1182,101 @@ export function App() {
     setCtxMenu(null);
 
     if (tool === "copy") {
-      setClipClipboard({ ...clip, id: clip.id });
+      setClipClipboard({ ...clip });
       flash("Copied");
       setTool("select");
       return;
     }
 
-    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    const tracksEl = timelineLaneRef.current?.querySelector(".timeline-tracks") as HTMLElement | null;
+    const widthEl = tracksEl ?? timelineLaneRef.current;
+    if (!widthEl) return;
+
+    const laneWidth = widthEl.getBoundingClientRect().width || 1;
+    const startX = e.clientX;
+    const origStartMs = clip.range.startMs;
+    const dur = clip.range.endMs - clip.range.startMs;
+    const clipId = clip.id;
+    let fromTrackId = clip.trackId;
+    const kind = tracksRef.current.find((t) => t.id === fromTrackId)?.kind;
+
+    setUndoStack((s) => [...s.slice(-29), project]);
+    setRedoStack([]);
     dragRef.current = {
-      clipId: clip.id,
-      startX: e.clientX,
+      clipId,
+      startX,
       startY: e.clientY,
-      origStartMs: clip.range.startMs,
-      durationMs: clip.range.endMs - clip.range.startMs,
-      fromTrackId: clip.trackId,
+      origStartMs,
+      durationMs: dur,
+      fromTrackId,
     };
-  }, [tool]);
 
-  const findTrackAtY = useCallback((clientY: number): Track | null => {
-    const canvas = timelineLaneRef.current;
-    if (!canvas) return null;
-    const lanes = canvas.querySelectorAll<HTMLElement>(".track-lane");
-    for (const lane of lanes) {
-      const r = lane.getBoundingClientRect();
-      if (clientY >= r.top && clientY <= r.bottom) {
-        const id = lane.dataset.trackId;
-        return project.tracks.find((t) => t.id === id) ?? null;
+    const findTrackAtY = (clientY: number): Track | null => {
+      const root = timelineLaneRef.current;
+      if (!root) return null;
+      const lanes = root.querySelectorAll<HTMLElement>(".track-lane");
+      for (const lane of lanes) {
+        const r = lane.getBoundingClientRect();
+        if (clientY >= r.top && clientY <= r.bottom) {
+          const id = lane.dataset.trackId;
+          return tracksRef.current.find((t) => t.id === id) ?? null;
+        }
       }
-    }
-    return null;
-  }, [project.tracks]);
+      return null;
+    };
 
-  useEffect(() => {
-    const onMove = (e: PointerEvent) => {
-      if (!dragRef.current || !timelineLaneRef.current) return;
-      const canvas = timelineLaneRef.current;
-      const laneWidth = canvas.getBoundingClientRect().width;
-      const dx = e.clientX - dragRef.current.startX;
-      const dMs = (dx / laneWidth) * duration;
-      const newStart = Math.max(0, dragRef.current.origStartMs + dMs);
-      const dur = dragRef.current.durationMs;
-      const clipId = dragRef.current.clipId;
+    const onMove = (ev: PointerEvent) => {
+      if (!dragRef.current) return;
+      const dx = ev.clientX - startX;
+      const dMs = (dx / laneWidth) * (durationRef.current / Math.max(1, zoomRef.current));
+      const newStart = Math.max(0, origStartMs + dMs);
+
+      const over = findTrackAtY(ev.clientY);
+      const switchTo =
+        over && over.id !== fromTrackId && over.kind === kind ? over : null;
+
+      if (switchTo) {
+        const targetId = switchTo.id;
+        setProject((p) => {
+          let moving: Clip | null = null;
+          for (const t of p.tracks) {
+            const c = t.clips.find((x) => x.id === clipId);
+            if (c) {
+              moving = c;
+              break;
+            }
+          }
+          if (!moving) return p;
+          fromTrackId = targetId;
+          if (dragRef.current) dragRef.current.fromTrackId = targetId;
+          return {
+            ...p,
+            durationMs: Math.max(p.durationMs, newStart + dur),
+            tracks: p.tracks.map((t) => {
+              if (t.clips.some((c) => c.id === clipId)) {
+                return { ...t, clips: t.clips.filter((c) => c.id !== clipId) };
+              }
+              if (t.id === targetId) {
+                return {
+                  ...t,
+                  clips: [
+                    ...t.clips.filter((c) => c.id !== clipId),
+                    {
+                      ...moving!,
+                      trackId: targetId,
+                      range: { startMs: newStart, endMs: newStart + dur },
+                    },
+                  ],
+                };
+              }
+              return t;
+            }),
+          };
+        });
+        setTargetTrackId(targetId);
+        return;
+      }
+
       setProject((p) => ({
         ...p,
         durationMs: Math.max(p.durationMs, newStart + dur),
@@ -819,48 +1290,16 @@ export function App() {
         })),
       }));
     };
-    const onUp = (e: PointerEvent) => {
-      if (!dragRef.current) return;
-      const { clipId, fromTrackId } = dragRef.current;
-      const over = findTrackAtY(e.clientY);
-      if (over && over.id !== fromTrackId) {
-        setProject((p) => {
-          const from = p.tracks.find((t) => t.id === fromTrackId);
-          const clip = from?.clips.find((c) => c.id === clipId);
-          if (!clip || !from) return p;
-          // only same kind (video↔video, audio↔audio)
-          if (from.kind !== over.kind) {
-            flash(`Cannot move ${from.kind} → ${over.kind}`);
-            return p;
-          }
-          return {
-            ...p,
-            tracks: p.tracks.map((t) => {
-              if (t.id === fromTrackId) {
-                return { ...t, clips: t.clips.filter((c) => c.id !== clipId) };
-              }
-              if (t.id === over.id) {
-                return {
-                  ...t,
-                  clips: [...t.clips, { ...clip, trackId: over.id }],
-                };
-              }
-              return t;
-            }),
-          };
-        });
-        setTargetTrackId(over.id);
-        flash(`Moved → ${over.name}`);
-      }
+
+    const onUp = () => {
       dragRef.current = null;
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [duration, findTrackAtY]);
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [tool]);
 
 
   const reimportAll = useCallback(() => {
@@ -924,6 +1363,8 @@ export function App() {
       flash("Clipboard empty");
       return;
     }
+    setUndoStack((s) => [...s.slice(-29), project]);
+    setRedoStack([]);
     const kind = project.tracks.find((t) => t.id === clipClipboard.trackId)?.kind
       ?? project.tracks.find((t) => t.id === (targetTrackId ?? ""))?.kind
       ?? "VIDEO";
@@ -993,6 +1434,8 @@ export function App() {
   // ---------- SPLIT / DELETE ----------
   const splitAtPlayhead = useCallback(() => {
     const ph = project.playheadMs;
+    setUndoStack((s) => [...s.slice(-29), project]);
+    setRedoStack([]);
     setProject((p) => {
       let changed = false;
       const tracks = p.tracks.map((t) => {
@@ -1033,6 +1476,8 @@ export function App() {
 
   const deleteSelectedClip = useCallback(() => {
     if (!selectedClipId) return;
+    setUndoStack((s) => [...s.slice(-29), project]);
+    setRedoStack([]);
     setProject((p) => ({
       ...p,
       tracks: p.tracks.map((t) => ({
@@ -1042,16 +1487,16 @@ export function App() {
     }));
     setSelectedClipId(null);
     flash("Clip deleted");
-  }, [selectedClipId]);
+  }, [selectedClipId, project]);
 
   const onTimelineClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current) return;
       const rect = e.currentTarget.getBoundingClientRect();
-      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      seekTo(pct * duration);
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * 100;
+      seekTo(pctToMs(pct));
     },
-    [duration, seekTo]
+    [seekTo, clampedViewStart, viewDurationMs]
   );
 
   // ---------- AI ----------
@@ -1103,7 +1548,8 @@ export function App() {
     };
   }, [ctxMenu]);
 
-  const playheadPct = Math.min(100, (project.playheadMs / duration) * 100);
+  const playheadPct = msToPct(project.playheadMs);
+  const playheadInView = project.playheadMs >= clampedViewStart && project.playheadMs <= clampedViewStart + viewDurationMs;
   const vaultStatus = localOnlyVaultAdapter.getStatus();
 
   useEffect(() => {
@@ -1113,7 +1559,8 @@ export function App() {
         e.preventDefault();
         togglePlay();
       }
-      if (e.key === "c" || e.key === "C") {
+      // V = razor/cut. C unbound (Ctrl+C = copy).
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) {
         e.preventDefault();
         splitAtPlayhead();
       }
@@ -1141,15 +1588,56 @@ export function App() {
         setTool("select");
         setCtxMenu(null);
       }
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        zoomAroundPlayhead(1.5);
+      }
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        zoomAroundPlayhead(1 / 1.5);
+      }
+      if (e.key === "ArrowLeft" && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        stepFrame(-1);
+      }
+      if (e.key === "ArrowRight" && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        stepFrame(1);
+      }
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        zoomFit();
+      }
+      if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        if (loopInMs != null && loopOutMs != null) {
+          setLoopEnabled((v) => !v);
+        }
+      }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z") && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      }
+      if ((e.metaKey || e.ctrlKey) && ((e.key === "y" || e.key === "Y") || ((e.key === "z" || e.key === "Z") && e.shiftKey))) {
+        e.preventDefault();
+        redo();
+      }
+      if ((e.key === "s" || e.key === "S") && !(e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setSnapEnabled((v) => {
+          flash(!v ? "Snap ON" : "Snap OFF");
+          return !v;
+        });
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject, addMarkerAtPlayhead, copySelectedClip, pasteClipAtPlayhead]);
+  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject, addMarkerAtPlayhead, copySelectedClip, pasteClipAtPlayhead, zoomAroundPlayhead, stepFrame, zoomFit, undo, redo, loopInMs, loopOutMs]);
 
   return (
     <div className="app">
       <header className="topbar">
-        <div className="logo">AILEXSI Resonance</div>
+        <div className="logo">AILEXSI Resonance Studio Suite <span className="version">V{APP_VERSION}</span></div>
         <nav>
           <button type="button" onClick={() => {
             stopPlayback();
@@ -1169,14 +1657,14 @@ export function App() {
           <button type="button" onClick={() => openInputRef.current?.click()}>Open</button>
           <button type="button" onClick={() => downloadProject()}>Save</button>
           <button type="button" onClick={() => void renderComposition()} disabled={isRendering}>
-            {isRendering ? `Render ${renderProgress}%` : "Export"}
+            {isRendering ? `Render ${renderProgress}%` : desktopMp4Ready ? "Export MP4" : "Export"}
           </button>
           {isRendering && (
             <button type="button" onClick={cancelExport} style={{ color: "#f88", borderColor: "#a44" }}>
               Cancel
             </button>
           )}
-          <button type="button" onClick={splitAtPlayhead} title="C">Cut</button>
+          <button type="button" onClick={splitAtPlayhead} title="V — cut at playhead">Cut</button>
           <button type="button" onClick={addMarkerAtPlayhead} title="M — marker at playhead">Marker</button>
           <button type="button" onClick={deleteSelectedClip}>Delete</button>
         </nav>
@@ -1349,22 +1837,35 @@ export function App() {
       <main className="viewer">
         <div className="viewer-screen">
           {activeVideoAsset ? (
-            <video
-              key={activeVideoAsset.id}
-              ref={videoRef}
-              src={activeVideoAsset.localPathOrUrl}
-              muted={muteVideo}
-              playsInline
-              preload="auto"
+            <div
               style={{
-                maxWidth: "100%",
-                maxHeight: "100%",
-                width: "auto",
-                height: "auto",
-                objectFit: "contain",
-                background: "#000",
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                overflow: "hidden",
               }}
-            />
+            >
+              <video
+                key={activeVideoAsset.id}
+                ref={videoRef}
+                src={activeVideoAsset.localPathOrUrl}
+                muted={muteVideo}
+                playsInline
+                preload="auto"
+                disablePictureInPicture
+                controlsList="nodownload noplaybackrate noremoteplayback"
+                style={{
+                  maxWidth: "100%",
+                  maxHeight: "100%",
+                  width: "auto",
+                  height: "auto",
+                  objectFit: "contain",
+                  background: "#000",
+                }}
+              />
+            </div>
           ) : (
             <div className="placeholder">
               <div style={{ fontSize: 16, marginBottom: 8 }}>Main Output</div>
@@ -1397,8 +1898,84 @@ export function App() {
             {isPlaying ? "❚❚" : "▶"}
           </button>
           <button type="button" onClick={() => { stopPlayback(); seekTo(0); }}>⏹</button>
-          <button type="button" onClick={splitAtPlayhead} title="C">✂</button>
+          <button
+            type="button"
+            onClick={() => {
+              if (loopInMs == null || loopOutMs == null) {
+                flash("Set IN/OUT on ruler first (two clicks)");
+                return;
+              }
+              setLoopEnabled((v) => {
+                flash(!v ? "Loop ON" : "Loop OFF");
+                return !v;
+              });
+            }}
+            title="Loop IN↔OUT"
+            style={{
+              color: loopEnabled ? "#3ecf8e" : undefined,
+              borderColor: loopEnabled ? "#3ecf8e" : undefined,
+              background: loopEnabled ? "rgba(62,207,142,0.12)" : undefined,
+            }}
+          >
+            🔁
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setLoopInMs(null);
+              setLoopOutMs(null);
+              setLoopEnabled(false);
+              setRangeClickStep("in");
+              flash("Range cleared");
+            }}
+            title="Clear IN/OUT range"
+          >
+            ⌫
+          </button>
+          <button type="button" onClick={splitAtPlayhead} title="V — cut at playhead">✂</button>
+          <button type="button" onClick={() => stepFrame(-1)} title="Frame − (←)">‹</button>
+          <button type="button" onClick={() => stepFrame(1)} title="Frame + (→)">›</button>
           <span className="time">{formatTime(project.playheadMs)}</span>
+          <label
+            className="muted"
+            style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, marginLeft: 8 }}
+            title="Zoom at playhead / marker"
+          >
+            Zoom
+            <input
+              type="range"
+              min={1}
+              max={64}
+              step={0.1}
+              value={timelineZoom}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                const vd = Math.max(500, duration / next);
+                // keep playhead centered in the view
+                const center = project.playheadMs;
+                setViewStartMs(Math.max(0, Math.min(Math.max(0, duration - vd), center - vd / 2)));
+                setTimelineZoom(next);
+              }}
+              style={{ width: 110, accentColor: "#5b8def", cursor: "pointer" }}
+            />
+            <span style={{ minWidth: 36, fontVariantNumeric: "tabular-nums" }}>
+              {timelineZoom < 1.05 ? "Fit" : `${timelineZoom.toFixed(1)}×`}
+            </span>
+          </label>
+          <button type="button" onClick={zoomFit} title="Fit whole project (F)">Fit</button>
+          <button
+            type="button"
+            onClick={() => setSnapEnabled((v) => !v)}
+            title="Snap (S)"
+            style={{
+              color: snapEnabled ? "#5b8def" : undefined,
+              borderColor: snapEnabled ? "#5b8def" : undefined,
+            }}
+          >
+            Snap
+          </button>
+          <button type="button" onClick={undo} title="Undo (Ctrl+Z)">↶</button>
+          <button type="button" onClick={redo} title="Redo (Ctrl+Y)">↷</button>
           <div className="scrub" onClick={onTimelineClick}>
             <div className="fill" style={{ width: `${playheadPct}%` }} />
           </div>
@@ -1424,7 +2001,7 @@ export function App() {
                 background: "#4af", borderRadius: 3, transition: "width 0.2s",
               }} />
             </div>
-            <div className="muted" style={{ fontSize: 12 }}>{renderProgress}% — WebM export</div>
+            <div className="muted" style={{ fontSize: 12 }}>{renderProgress}% — {exportPhase === "saving" ? "Saving file…" : "Recording"}</div>
             <button
               type="button"
               onClick={cancelExport}
@@ -1458,9 +2035,9 @@ export function App() {
         ) : (
           <p className="muted" style={{ marginBottom: 16, lineHeight: 1.55, fontSize: 12 }}>
             <strong>Shortcuts</strong><br />
-            Space Play/Pause · C Cut · M Marker · Del Delete<br />
-            Ctrl+C / Ctrl+V · Right-click tools<br />
-            Drag clip to other track (same kind)
+            Space Play · ← → Frame · + − Zoom · F Fit<br />
+            Ctrl+Wheel zoom · Wheel pan<br />
+            V Cut · M Marker · Drag tracks · C free
           </p>
         )}
         {selectedClipId && (
@@ -1480,44 +2057,6 @@ export function App() {
         <div className="field">
           <label>Tracks</label>
           <div className="muted">V1 V2 · A1 A2 · crossover ready</div>
-        </div>
-
-        <div className="field" style={{ marginTop: "auto", paddingTop: 12, borderTop: "1px solid #2a3140" }}>
-          <label>MAIN OUT</label>
-          <div style={{ display: "flex", gap: 10, alignItems: "stretch", height: 120 }}>
-            <div style={{
-              width: 10, background: "#0a0c0f", borderRadius: 4, position: "relative", overflow: "hidden",
-              border: "1px solid #333",
-            }}>
-              <div style={{
-                position: "absolute", left: 0, right: 0, bottom: 0,
-                height: `${Math.round(meterLevel * 100)}%`,
-                background: meterLevel > 0.85 ? "#e74c3c" : meterLevel > 0.6 ? "#f5a623" : "#3ecf8e",
-                transition: "height 0.08s linear",
-              }} />
-            </div>
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.01}
-                value={masterVolume}
-                onChange={(e) => setMasterVolume(Number(e.target.value))}
-                orient="vertical"
-                style={{
-                  width: "100%",
-                  writingMode: "vertical-lr" as unknown as undefined,
-                  direction: "rtl",
-                  height: 90,
-                  accentColor: "#5b8def",
-                }}
-              />
-              <div className="muted" style={{ fontSize: 11, textAlign: "center" }}>
-                {Math.round(masterVolume * 100)}%
-              </div>
-            </div>
-          </div>
         </div>
 
       </aside>
@@ -1558,24 +2097,119 @@ export function App() {
               }
               setCtxMenu(null);
             }}
+            onWheel={(e) => {
+              e.preventDefault();
+              if (e.ctrlKey || e.metaKey) {
+                // zoom around cursor
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pct = (e.clientX - rect.left) / rect.width;
+                const anchorMs = clampedViewStart + pct * viewDurationMs;
+                const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+                setTimelineZoom((z) => {
+                  const next = Math.min(64, Math.max(1, z * factor));
+                  const vd = Math.max(500, duration / next);
+                  setViewStartMs(Math.max(0, Math.min(duration - vd, anchorMs - pct * vd)));
+                  return next;
+                });
+              } else {
+                // pan
+                const shift = (e.deltaY + e.deltaX) * viewDurationMs * 0.0015;
+                setViewStartMs((s) =>
+                  Math.max(0, Math.min(Math.max(0, duration - viewDurationMs), s + shift))
+                );
+              }
+            }}
           >
-            <div className="timeline-ruler" onClick={onTimelineClick}>
-              {[0, 0.25, 0.5, 0.75, 1].map((p) => (
-                <span
-                  key={p}
-                  style={{
-                    position: "absolute",
-                    left: `${p * 100}%`,
-                    transform: "translateX(-50%)",
-                    top: 4,
-                    pointerEvents: "none",
-                  }}
-                >
-                  {formatTime(p * duration)}
-                </span>
-              ))}
+            <div
+              className="timeline-ruler"
+              onClick={(e) => {
+                // Left click = jump only
+                if (dragRef.current) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * 100;
+                seekTo(pctToMs(pct));
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * 100;
+                const t = pctToMs(pct);
+                seekTo(t);
+                // Right-click: IN then OUT
+                if (rangeClickStep === "in" || loopInMs === null) {
+                  setLoopInMs(t);
+                  setLoopOutMs(null);
+                  setRangeClickStep("out");
+                  flash(`IN ${formatTime(t)} — right-click OUT`);
+                } else {
+                  const a = Math.min(loopInMs!, t);
+                  const b = Math.max(loopInMs!, t);
+                  if (b - a < 50) {
+                    flash("Range too short");
+                    return;
+                  }
+                  setLoopInMs(a);
+                  setLoopOutMs(b);
+                  setRangeClickStep("in");
+                  flash(`OUT ${formatTime(b)} · range set`);
+                }
+              }}
+            >
+              {/* Tick marks: denser when zoomed */}
+              {(() => {
+                const major =
+                  timelineZoom >= 32 ? 20 : timelineZoom >= 12 ? 12 : timelineZoom >= 4 ? 8 : 4;
+                const minor = major * 4;
+                const ticks = [];
+                for (let i = 0; i <= minor; i++) {
+                  const p = i / minor;
+                  const isMajor = i % 4 === 0;
+                  ticks.push(
+                    <div
+                      key={`t${i}`}
+                      className={`ruler-tick ${isMajor ? "major" : "minor"}`}
+                      style={{ left: `${p * 100}%` }}
+                    />
+                  );
+                  if (isMajor) {
+                    ticks.push(
+                      <span
+                        key={`l${i}`}
+                        className="ruler-label"
+                        style={{ left: `${p * 100}%` }}
+                      >
+                        {formatTime(clampedViewStart + p * viewDurationMs)}
+                      </span>
+                    );
+                  }
+                }
+                return ticks;
+              })()}
+              {timelineZoom > 1.2 && (
+                <span className="ruler-zoom-badge">{timelineZoom.toFixed(1)}×</span>
+              )}
             </div>
             <div className="timeline-tracks">
+              {loopInMs != null && loopOutMs != null && (
+                <div
+                  className="loop-region"
+                  style={{
+                    left: `${msToPct(loopInMs)}%`,
+                    width: `${Math.max(0.2, msToPct(loopOutMs) - msToPct(loopInMs))}%`,
+                  }}
+                />
+              )}
+              {loopInMs != null && loopInMs >= clampedViewStart && loopInMs <= clampedViewStart + viewDurationMs && (
+                <div className="loop-flag in" style={{ left: `${msToPct(loopInMs)}%` }} title="Loop IN">
+                  <span className="loop-flag-label">IN</span>
+                </div>
+              )}
+              {loopOutMs != null && loopOutMs >= clampedViewStart && loopOutMs <= clampedViewStart + viewDurationMs && (
+                <div className="loop-flag out" style={{ left: `${msToPct(loopOutMs)}%` }} title="Loop OUT">
+                  <span className="loop-flag-label">OUT</span>
+                </div>
+              )}
               {project.tracks.map((track) => (
                 <div
                   key={track.id}
@@ -1591,8 +2225,12 @@ export function App() {
                   }}
                 >
                   {track.clips.map((clip) => {
-                    const left = (clip.range.startMs / duration) * 100;
-                    const width = ((clip.range.endMs - clip.range.startMs) / duration) * 100;
+                    const c0 = clip.range.startMs;
+                    const c1 = clip.range.endMs;
+                    if (c1 < clampedViewStart || c0 > clampedViewStart + viewDurationMs) return null;
+                    const left = msToPct(c0);
+                    const right = msToPct(c1);
+                    const width = Math.max(right - left, 0.15);
                     const selected = selectedClipId === clip.id;
                     return (
                       <div
@@ -1600,7 +2238,7 @@ export function App() {
                         className={`clip ${track.kind}`}
                         style={{
                           left: `${left}%`,
-                          width: `${Math.max(width, 0.5)}%`,
+                          width: `${width}%`,
                           outline: selected ? "2px solid #fff" : undefined,
                           cursor: "grab",
                           zIndex: selected ? 3 : 1,
@@ -1613,7 +2251,19 @@ export function App() {
                           setTargetTrackId(track.id);
                         }}
                       >
-                        {clip.label || track.name}
+                        {track.kind === "AUDIO" && (() => {
+                          const asset = project.mediaAssets.find((a) => a.id === clip.mediaAssetId);
+                          const peaks = asset?.analysis?.waveformPeaks;
+                          if (!peaks?.length) return null;
+                          return (
+                            <div className="clip-wave" aria-hidden>
+                              {peaks.map((pk, i) => (
+                                <span key={i} style={{ height: `${Math.max(8, pk * 100)}%` }} />
+                              ))}
+                            </div>
+                          );
+                        })()}
+                        <span className="clip-label">{clip.label || track.name}</span>
                       </div>
                     );
                   })}
@@ -1621,17 +2271,43 @@ export function App() {
               ))}
             </div>
             {/* single playhead spanning ruler + all lanes */}
-            <div className="timeline-playhead" style={{ left: `${playheadPct}%` }} />
+            {playheadInView && <div className="timeline-playhead" style={{ left: `${playheadPct}%` }} />}
             {project.markers
               .filter((m) => m.kind !== "beat")
+              .filter((m) => m.timeMs >= clampedViewStart && m.timeMs <= clampedViewStart + viewDurationMs)
               .map((m) => (
                 <div
                   key={m.id}
                   className="timeline-marker"
                   data-label={m.label}
-                  style={{ left: `${Math.min(100, (m.timeMs / duration) * 100)}%` }}
+                  style={{ left: `${msToPct(m.timeMs)}%` }}
                 />
               ))}
+          </div>
+          {/* Master strip — fader + live peak */}
+          <div className="master-strip" title="Main Out">
+            <div className="master-label">MAIN</div>
+            <div className="master-meter">
+              <div
+                className="master-meter-fill"
+                style={{
+                  height: `${Math.round(meterLevel * 100)}%`,
+                  background:
+                    meterLevel > 0.85 ? "#e74c3c" : meterLevel > 0.6 ? "#f5a623" : "#3ecf8e",
+                }}
+              />
+            </div>
+            <input
+              className="master-fader"
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={masterVolume}
+              onChange={(e) => setMasterVolume(Number(e.target.value))}
+              title={`Volume ${Math.round(masterVolume * 100)}%`}
+            />
+            <div className="master-pct">{Math.round(masterVolume * 100)}</div>
           </div>
         </div>
       </section>
@@ -1780,7 +2456,9 @@ export function App() {
               }}
             />
             <div className="muted" style={{ fontSize: 11 }}>
-              After render you can choose the save location (Chrome/Edge) or a download starts.
+              {loopInMs != null && loopOutMs != null
+                ? `MP4 export · IN→OUT only (${((loopOutMs - loopInMs) / 1000).toFixed(1)}s). Clear range for full timeline.`
+                : "Full timeline. Set IN/OUT (right-click ruler) to export a range."}
             </div>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button type="button" onClick={() => setShowExportDlg(false)}
