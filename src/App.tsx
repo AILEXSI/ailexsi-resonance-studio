@@ -39,6 +39,9 @@ export function App() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState(0);
+  const [exportName, setExportName] = useState("");
+  const [showExportDlg, setShowExportDlg] = useState(false);
+  const cancelRenderRef = useRef(false);
 
   const dragRef = useRef<{
     clipId: string;
@@ -456,13 +459,24 @@ export function App() {
   );
 
   /** Real media export: record mixed video (top track) + audio tracks → WebM */
-  const renderComposition = useCallback(async () => {
+  const cancelExport = useCallback(() => {
+    cancelRenderRef.current = true;
+    stopPlayback();
+    setIsRendering(false);
+    setRenderProgress(0);
+    setShowExportDlg(false);
+    flash("Export cancelled");
+  }, [stopPlayback]);
+
+  const startExportWithName = useCallback(async (filename: string) => {
     if (isRendering) return;
     if (project.durationMs < 200) {
       flash("Nothing to render — add clips first");
       return;
     }
-
+    const safeName = (filename || project.name || "resonance").replace(/[^\w\-]+/g, "_");
+    cancelRenderRef.current = false;
+    setShowExportDlg(false);
     setIsRendering(true);
     setRenderProgress(0);
     setPlayError(null);
@@ -556,41 +570,77 @@ export function App() {
 
     await startPlayback();
 
-    // Wait until playback ends (playhead hits duration or isPlaying false)
+    // Wait until end or cancel
     await new Promise<void>((resolve) => {
-      const start = performance.now();
-      const maxWait = total + 5000;
-      const check = () => {
-        setProject((p) => {
-          if (p.playheadMs >= total - 50 || performance.now() - start > maxWait) {
-            resolve();
-          } else {
-            requestAnimationFrame(check);
-          }
-          return p;
-        });
+      const t0 = performance.now();
+      const tickWait = () => {
+        if (cancelRenderRef.current) {
+          resolve();
+          return;
+        }
+        if (performance.now() - t0 >= total + 400) {
+          resolve();
+          return;
+        }
+        requestAnimationFrame(tickWait);
       };
-      // simpler: fixed duration wait based on timeline length
-      setTimeout(() => resolve(), total + 400);
+      tickWait();
     });
 
     stopPlayback();
     drawing = false;
     window.clearInterval(progressTimer);
 
+    if (cancelRenderRef.current) {
+      try { if (recorder.state !== "inactive") recorder.stop(); } catch { /* */ }
+      setIsRendering(false);
+      return;
+    }
+
     if (recorder.state !== "inactive") recorder.stop();
     const blob = await done;
 
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${(project.name || "resonance").replace(/\s+/g, "_")}_render.webm`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    const outName = `${safeName}.webm`;
+    // Prefer system save dialog when available
+    try {
+      const w = window as Window & {
+        showSaveFilePicker?: (opts: unknown) => Promise<FileSystemFileHandle>;
+      };
+      if (typeof w.showSaveFilePicker === "function") {
+        const handle = await w.showSaveFilePicker({
+          suggestedName: outName,
+          types: [{ description: "WebM video", accept: { "video/webm": [".webm"] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        flash(`Exported → ${handle.name}`);
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = outName;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        flash(`Exported → ${outName}`);
+      }
+    } catch (e: unknown) {
+      // user aborted picker
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/abort/i.test(msg)) {
+        flash("Export save cancelled");
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = outName;
+        a.click();
+        flash(`Exported → ${outName}`);
+      }
+    }
 
     setRenderProgress(100);
     setIsRendering(false);
-    flash("Export ready — WebM downloaded");
   }, [
     isRendering,
     project.durationMs,
@@ -599,6 +649,16 @@ export function App() {
     seekTo,
     startPlayback,
   ]);
+
+  const openExportDialog = useCallback(() => {
+    if (isRendering) return;
+    setExportName(`${(project.name || "resonance").replace(/\s+/g, "_")}_render`);
+    setShowExportDlg(true);
+  }, [isRendering, project.name]);
+
+  const renderComposition = useCallback(() => {
+    openExportDialog();
+  }, [openExportDialog]);
 
   const openProjectFile = useCallback(async (files: FileList | null) => {
     if (!files?.length) return;
@@ -835,6 +895,11 @@ export function App() {
           <button type="button" onClick={() => void renderComposition()} disabled={isRendering}>
             {isRendering ? `Render ${renderProgress}%` : "Export"}
           </button>
+          {isRendering && (
+            <button type="button" onClick={cancelExport} style={{ color: "#f88", borderColor: "#a44" }}>
+              Cancel
+            </button>
+          )}
           <button type="button" onClick={splitAtPlayhead} title="C">Cut</button>
           <button type="button" onClick={addMarkerAtPlayhead} title="M — marker at playhead">Marker</button>
           <button type="button" onClick={deleteSelectedClip}>Delete</button>
@@ -1060,6 +1125,17 @@ export function App() {
               }} />
             </div>
             <div className="muted" style={{ fontSize: 12 }}>{renderProgress}% — WebM export</div>
+            <button
+              type="button"
+              onClick={cancelExport}
+              style={{
+                marginTop: 8, padding: "8px 18px", borderRadius: 6,
+                border: "1px solid #a44", background: "#2a1515", color: "#faa",
+                cursor: "pointer", fontSize: 13,
+              }}
+            >
+              Cancel export
+            </button>
           </div>
         )}
       </main>
@@ -1108,79 +1184,90 @@ export function App() {
       </aside>
 
       <section className="timeline">
-        <div className="timeline-ruler-row">
-          <div className="timeline-ruler-gutter" />
-          <div className="timeline-ruler" onClick={onTimelineClick} style={{ cursor: "pointer" }}>
-            {[0, 0.25, 0.5, 0.75, 1].map((p) => (
-              <span key={p} style={{
-                position: "absolute", left: `${p * 100}%`, transform: "translateX(-50%)",
-                top: 4, pointerEvents: "none",
-              }}>{formatTime(p * duration)}</span>
-            ))}
-            {project.markers.filter((m) => m.kind !== "beat").map((m) => (
+        <div className="timeline-body">
+          <div className="timeline-labels">
+            <div className="timeline-label-spacer" />
+            {project.tracks.map((track) => (
               <div
-                key={m.id}
-                className="timeline-marker"
-                data-label={m.label}
-                style={{ left: `${Math.min(100, (m.timeMs / duration) * 100)}%` }}
-              />
-            ))}
-          </div>
-        </div>
-        <div className="timeline-tracks">
-          {project.tracks.map((track, idx) => (
-            <div key={track.id} className="track-row">
-              <div
-                className={`track-label ${track.kind}`}
+                key={track.id}
+                className={`timeline-label ${track.kind}${targetTrackId === track.id ? " active" : ""}`}
                 onClick={() => setTargetTrackId(track.id)}
-                style={{
-                  cursor: "pointer",
-                  outline: targetTrackId === track.id ? "1px solid #6af" : undefined,
-                }}
-                title="Click to set as target track for Place/Import"
+                title="Target track for Import / Place"
               >
                 {track.name}
               </div>
-              <div
-                className="track-lane"
-                ref={idx === 0 ? timelineLaneRef : undefined}
-                onClick={(e) => {
-                  setTargetTrackId(track.id);
-                  onTimelineClick(e);
-                }}
-                style={{ cursor: "pointer" }}
-              >
-                {track.clips.map((clip) => {
-                  const left = (clip.range.startMs / duration) * 100;
-                  const width = ((clip.range.endMs - clip.range.startMs) / duration) * 100;
-                  const selected = selectedClipId === clip.id;
-                  return (
-                    <div
-                      key={clip.id}
-                      className={`clip ${track.kind}`}
-                      style={{
-                        left: `${left}%`,
-                        width: `${Math.max(width, 0.5)}%`,
-                        outline: selected ? "2px solid #fff" : undefined,
-                        cursor: "grab",
-                        zIndex: selected ? 3 : 1,
-                      }}
-                      title={`${clip.label} — drag to move`}
-                      onPointerDown={(e) => onClipPointerDown(e, clip)}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelectedClipId(clip.id);
-                        setTargetTrackId(track.id);
-                      }}
-                    >
-                      {clip.label || track.name}
-                    </div>
-                  );
-                })}
-                <div className="playhead" style={{ left: `${playheadPct}%` }} />
-              </div>
+            ))}
+          </div>
+          <div className="timeline-canvas" ref={timelineLaneRef}>
+            <div className="timeline-ruler" onClick={onTimelineClick}>
+              {[0, 0.25, 0.5, 0.75, 1].map((p) => (
+                <span
+                  key={p}
+                  style={{
+                    position: "absolute",
+                    left: `${p * 100}%`,
+                    transform: "translateX(-50%)",
+                    top: 4,
+                    pointerEvents: "none",
+                  }}
+                >
+                  {formatTime(p * duration)}
+                </span>
+              ))}
             </div>
-          ))}
+            <div className="timeline-tracks">
+              {project.tracks.map((track) => (
+                <div
+                  key={track.id}
+                  className="track-lane"
+                  onClick={(e) => {
+                    setTargetTrackId(track.id);
+                    onTimelineClick(e);
+                  }}
+                >
+                  {track.clips.map((clip) => {
+                    const left = (clip.range.startMs / duration) * 100;
+                    const width = ((clip.range.endMs - clip.range.startMs) / duration) * 100;
+                    const selected = selectedClipId === clip.id;
+                    return (
+                      <div
+                        key={clip.id}
+                        className={`clip ${track.kind}`}
+                        style={{
+                          left: `${left}%`,
+                          width: `${Math.max(width, 0.5)}%`,
+                          outline: selected ? "2px solid #fff" : undefined,
+                          cursor: "grab",
+                          zIndex: selected ? 3 : 1,
+                        }}
+                        title={`${clip.label} — drag to move`}
+                        onPointerDown={(e) => onClipPointerDown(e, clip)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedClipId(clip.id);
+                          setTargetTrackId(track.id);
+                        }}
+                      >
+                        {clip.label || track.name}
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+            {/* single playhead spanning ruler + all lanes */}
+            <div className="timeline-playhead" style={{ left: `${playheadPct}%` }} />
+            {project.markers
+              .filter((m) => m.kind !== "beat")
+              .map((m) => (
+                <div
+                  key={m.id}
+                  className="timeline-marker"
+                  data-label={m.label}
+                  style={{ left: `${Math.min(100, (m.timeMs / duration) * 100)}%` }}
+                />
+              ))}
+          </div>
         </div>
       </section>
 
@@ -1195,6 +1282,47 @@ export function App() {
           Propose
         </button>
       </footer>
+
+      {showExportDlg && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)",
+          display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+        }}>
+          <div style={{
+            background: "#151a22", border: "1px solid #333", borderRadius: 10,
+            padding: 20, width: 360, display: "flex", flexDirection: "column", gap: 12,
+          }}>
+            <div style={{ fontWeight: 600 }}>Export composition</div>
+            <label style={{ fontSize: 12, color: "#8b93a7" }}>Filename</label>
+            <input
+              autoFocus
+              value={exportName}
+              onChange={(e) => setExportName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && exportName.trim()) void startExportWithName(exportName.trim());
+                if (e.key === "Escape") setShowExportDlg(false);
+              }}
+              style={{
+                padding: "8px 10px", borderRadius: 6, border: "1px solid #333",
+                background: "#0d0f12", color: "#e8eaed", fontSize: 13,
+              }}
+            />
+            <div className="muted" style={{ fontSize: 11 }}>
+              After render you can choose the save location (Chrome/Edge) or a download starts.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button type="button" onClick={() => setShowExportDlg(false)}
+                style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid #444", background: "transparent", color: "#ccc", cursor: "pointer" }}>
+                Cancel
+              </button>
+              <button type="button" onClick={() => void startExportWithName(exportName.trim() || "resonance_render")}
+                style={{ padding: "6px 12px", borderRadius: 6, border: "none", background: "#5b8def", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
+                Start export
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
