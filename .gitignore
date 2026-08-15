@@ -1,6 +1,7 @@
 node_modules/
 dist/
-.DS_Store
+.vite/
+src-tauri/target/
 *.local
-.env
-.env.*
+.DS_Store
+*.log
