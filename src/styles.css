@@ -27,7 +27,7 @@ html, body, #root { height: 100%; overflow: hidden; }
 
 .app {
   display: grid;
-  grid-template-rows: 40px 1fr 220px 56px;
+  grid-template-rows: 40px 1fr minmax(200px, 28vh) 48px;
   grid-template-columns: 240px 1fr 280px;
   height: 100vh;
   background: var(--bg);
@@ -168,7 +168,7 @@ html, body, #root { height: 100%; overflow: hidden; }
   font-size: 10px; color: var(--text-muted); cursor: pointer;
 }
 .timeline-tracks {
-  flex: 1; overflow-y: auto; position: relative;
+  flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; min-height: 0;
 }
 .track-lane {
   height: 36px; position: relative; background: #0f1216;

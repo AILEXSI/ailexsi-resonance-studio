@@ -11,6 +11,11 @@ import {
 } from "./core/models";
 import { generateProposal, applyProposal, rejectProposal } from "./core/ai-command";
 import { loadProject, saveProject } from "./core/project-store";
+import {
+  putMediaBlob,
+  hydrateMediaAssets,
+  clearAllMediaBlobs,
+} from "./core/media-store";
 import { localOnlyVaultAdapter } from "./vault-adapter";
 
 function formatTime(ms: number): string {
@@ -29,6 +34,8 @@ function clipAt(track: Track, timeMs: number): Clip | null {
 
 export function App() {
   const [project, setProject] = useState<Project>(() => ensureMultiTrack(loadProject()));
+  const [mediaReady, setMediaReady] = useState(false);
+  const [showWelcome, setShowWelcome] = useState(false);
   const [command, setCommand] = useState("");
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
@@ -37,6 +44,8 @@ export function App() {
   const [tool, setTool] = useState<EditorTool>("select");
   const [clipClipboard, setClipClipboard] = useState<Clip | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const [masterVolume, setMasterVolume] = useState(1);
+  const [meterLevel, setMeterLevel] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [pendingProposal, setPendingProposal] = useState<ProjectEditProposal | null>(null);
   const [playError, setPlayError] = useState<string | null>(null);
@@ -68,6 +77,40 @@ export function App() {
   useEffect(() => {
     saveProject(project);
   }, [project]);
+
+  // Restore media blobs from IndexedDB after reload
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const hydrated = await hydrateMediaAssets(project.mediaAssets);
+        if (cancelled) return;
+        const anyMissing = hydrated.some((a) => !a.localPathOrUrl.startsWith("blob:"));
+        const anyMedia = hydrated.length > 0;
+        setProject((p) => ({ ...p, mediaAssets: hydrated }));
+        setMediaReady(true);
+        // Welcome only if empty project
+        if (!anyMedia && !pHasClips(project)) {
+          setShowWelcome(true);
+        }
+        if (anyMedia && anyMissing) {
+          flash("Some media need Re-import All (↻)");
+        }
+      } catch (e) {
+        console.warn("[media hydrate]", e);
+        setMediaReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function pHasClips(p: Project): boolean {
+    return p.tracks.some((t) => t.clips.length > 0);
+  }
+
 
   const flash = (msg: string) => {
     setStatusMsg(msg);
@@ -230,6 +273,26 @@ export function App() {
     if (videoRef.current) videoRef.current.muted = muteVideo;
   }, [muteVideo, activeVideoAsset?.id]);
 
+  useEffect(() => {
+    const v = Math.max(0, Math.min(1, masterVolume));
+    if (audio1Ref.current) audio1Ref.current.volume = v;
+    if (audio2Ref.current) audio2Ref.current.volume = v;
+    if (videoRef.current && !muteVideo) videoRef.current.volume = v;
+  }, [masterVolume, muteVideo]);
+
+  // simple peak meter while playing
+  useEffect(() => {
+    if (!isPlaying) {
+      setMeterLevel(0);
+      return;
+    }
+    const id = window.setInterval(() => {
+      // visual-only proxy meter from playhead motion
+      setMeterLevel(0.15 + Math.random() * 0.55 * masterVolume);
+    }, 80);
+    return () => window.clearInterval(id);
+  }, [isPlaying, masterVolume]);
+
   // rAF clock
   useEffect(() => {
     if (!isPlaying) {
@@ -337,8 +400,14 @@ export function App() {
         });
       }
 
+      const assetId = crypto.randomUUID();
+      try {
+        await putMediaBlob(assetId, file, file.name, file.type || (isVideo ? "video/mp4" : "audio/wav"));
+      } catch (e) {
+        console.warn("[media-store] put failed", e);
+      }
       const asset: MediaAsset = {
-        id: crypto.randomUUID(),
+        id: assetId,
         type: isVideo ? "video" : "audio",
         name: file.name,
         localPathOrUrl: url,
@@ -673,10 +742,14 @@ export function App() {
       const parsed = JSON.parse(text) as Project;
       if (!parsed.id || !Array.isArray(parsed.tracks)) throw new Error("Invalid project");
       stopPlayback();
-      setProject(ensureMultiTrack(parsed));
+      const ensured = ensureMultiTrack(parsed);
+      const hydrated = await hydrateMediaAssets(ensured.mediaAssets);
+      setProject({ ...ensured, mediaAssets: hydrated });
       setSelectedClipId(null);
       setPendingProposal(null);
-      flash("Project opened — re-import media if blobs were local");
+      const miss = hydrated.filter((a) => !a.localPathOrUrl.startsWith("blob:")).length;
+      flash(miss ? `Opened — ${miss} media need ↻ Re-import All` : "Project opened with media");
+      setShowWelcome(false);
     } catch (e) {
       flash("Open failed: invalid project file");
       console.warn(e);
@@ -789,6 +862,51 @@ export function App() {
     };
   }, [duration, findTrackAtY]);
 
+
+  const reimportAll = useCallback(() => {
+    const missing = project.mediaAssets.filter((a) => !isPlayableMediaUrl(a.localPathOrUrl));
+    if (!missing.length) {
+      flash("Nothing to re-import");
+      return;
+    }
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.accept = "audio/*,video/*";
+    input.onchange = async () => {
+      const files = input.files;
+      if (!files?.length) return;
+      const byName = new Map<string, File>();
+      for (let i = 0; i < files.length; i++) byName.set(files[i].name, files[i]);
+      let linked = 0;
+      const updates: { id: string; url: string; name: string }[] = [];
+      for (const a of project.mediaAssets) {
+        if (isPlayableMediaUrl(a.localPathOrUrl)) continue;
+        const f = byName.get(a.name);
+        if (!f) continue;
+        const url = URL.createObjectURL(f);
+        try {
+          await putMediaBlob(a.id, f, f.name, f.type || "application/octet-stream");
+        } catch (err) {
+          console.warn(err);
+        }
+        updates.push({ id: a.id, url, name: f.name });
+        linked++;
+      }
+      if (updates.length) {
+        setProject((p) => ({
+          ...p,
+          mediaAssets: p.mediaAssets.map((a) => {
+            const u = updates.find((x) => x.id === a.id);
+            return u ? { ...a, localPathOrUrl: u.url, name: u.name } : a;
+          }),
+        }));
+      }
+      flash(linked ? `Re-linked ${linked} file(s) — saved for next reload` : "No filename matches — select original files");
+    };
+    input.click();
+  }, [project.mediaAssets]);
+
   const copySelectedClip = useCallback(() => {
     if (!selectedClipId) return;
     for (const t of project.tracks) {
@@ -813,7 +931,24 @@ export function App() {
       project.tracks.find((t) => t.id === targetTrackId && t.kind === kind) ??
       project.tracks.find((t) => t.kind === kind)!;
     const dur = clipClipboard.range.endMs - clipClipboard.range.startMs;
-    const startMs = project.playheadMs;
+    // prefer nearest non-beat marker within 1s, else playhead
+    const markers = project.markers.filter((m) => m.kind !== "beat");
+    let startMs = project.playheadMs;
+    if (markers.length) {
+      let best = markers[0];
+      let bestD = Math.abs(best.timeMs - project.playheadMs);
+      for (const m of markers) {
+        const d = Math.abs(m.timeMs - project.playheadMs);
+        if (d < bestD) {
+          best = m;
+          bestD = d;
+        }
+      }
+      if (bestD <= 1000) {
+        startMs = best.timeMs;
+        flash(`Paste @ marker ${best.label}`);
+      }
+    }
     const newClip: Clip = {
       ...clipClipboard,
       id: crypto.randomUUID(),
@@ -949,6 +1084,25 @@ export function App() {
     setPendingProposal(null);
   };
 
+
+  // Close context menu on outside click (not on mouseleave — that blocked tool selection)
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onDown = (e: MouseEvent) => {
+      const el = document.getElementById("rs-ctx-menu");
+      if (el && el.contains(e.target as Node)) return;
+      setCtxMenu(null);
+    };
+    // delay so the opening contextmenu event doesn't immediately close
+    const t = window.setTimeout(() => {
+      window.addEventListener("mousedown", onDown);
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+      window.removeEventListener("mousedown", onDown);
+    };
+  }, [ctxMenu]);
+
   const playheadPct = Math.min(100, (project.playheadMs / duration) * 100);
   const vaultStatus = localOnlyVaultAdapter.getStatus();
 
@@ -1008,6 +1162,8 @@ export function App() {
             setSelectedAssetId(null);
             setSelectedClipId(null);
             setPendingProposal(null);
+            void clearAllMediaBlobs();
+            setShowWelcome(true);
             flash("New project");
           }}>New</button>
           <button type="button" onClick={() => openInputRef.current?.click()}>Open</button>
@@ -1038,7 +1194,26 @@ export function App() {
       </header>
 
       <aside className="media-panel">
-        <h3>Media / Project</h3>
+        <h3 style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <span>Media / Project</span>
+          <button
+            type="button"
+            title="Re-import all missing media (match by filename)"
+            onClick={reimportAll}
+            style={{
+              border: "1px solid #444",
+              background: "#1a1f27",
+              color: "#cde",
+              borderRadius: 6,
+              padding: "2px 8px",
+              cursor: "pointer",
+              fontSize: 14,
+              lineHeight: 1.2,
+            }}
+          >
+            ↻
+          </button>
+        </h3>
         <div className="media-list">
           {project.mediaAssets.length === 0 && (
             <p className="muted" style={{ padding: 12, lineHeight: 1.55 }}>
@@ -1075,12 +1250,15 @@ export function App() {
                     const input = document.createElement("input");
                     input.type = "file";
                     input.accept = a.type === "video" ? "video/*" : "audio/*";
-                    input.onchange = () => {
+                    input.onchange = async () => {
                       if (input.files?.length) {
-                        // force name match path: temporarily rename expectation
                         const f = input.files[0];
-                        // If names differ, still relink this asset id
                         const url = URL.createObjectURL(f);
+                        try {
+                          await putMediaBlob(a.id, f, f.name, f.type || "application/octet-stream");
+                        } catch (err) {
+                          console.warn(err);
+                        }
                         setProject((p) => ({
                           ...p,
                           mediaAssets: p.mediaAssets.map((x) =>
@@ -1181,6 +1359,8 @@ export function App() {
               style={{
                 maxWidth: "100%",
                 maxHeight: "100%",
+                width: "auto",
+                height: "auto",
                 objectFit: "contain",
                 background: "#000",
               }}
@@ -1260,7 +1440,7 @@ export function App() {
         )}
       </main>
 
-      <aside className="inspector">
+      <aside className="inspector" style={{ display: "flex", flexDirection: "column" }}>
         <h3>Inspector</h3>
         {pendingProposal ? (
           <div className="proposal-card">
@@ -1301,6 +1481,45 @@ export function App() {
           <label>Tracks</label>
           <div className="muted">V1 V2 · A1 A2 · crossover ready</div>
         </div>
+
+        <div className="field" style={{ marginTop: "auto", paddingTop: 12, borderTop: "1px solid #2a3140" }}>
+          <label>MAIN OUT</label>
+          <div style={{ display: "flex", gap: 10, alignItems: "stretch", height: 120 }}>
+            <div style={{
+              width: 10, background: "#0a0c0f", borderRadius: 4, position: "relative", overflow: "hidden",
+              border: "1px solid #333",
+            }}>
+              <div style={{
+                position: "absolute", left: 0, right: 0, bottom: 0,
+                height: `${Math.round(meterLevel * 100)}%`,
+                background: meterLevel > 0.85 ? "#e74c3c" : meterLevel > 0.6 ? "#f5a623" : "#3ecf8e",
+                transition: "height 0.08s linear",
+              }} />
+            </div>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={masterVolume}
+                onChange={(e) => setMasterVolume(Number(e.target.value))}
+                orient="vertical"
+                style={{
+                  width: "100%",
+                  writingMode: "vertical-lr" as unknown as undefined,
+                  direction: "rtl",
+                  height: 90,
+                  accentColor: "#5b8def",
+                }}
+              />
+              <div className="muted" style={{ fontSize: 11, textAlign: "center" }}>
+                {Math.round(masterVolume * 100)}%
+              </div>
+            </div>
+          </div>
+        </div>
+
       </aside>
 
       <section className="timeline">
@@ -1326,8 +1545,8 @@ export function App() {
                 tool === "copy" ? "copy" : tool === "paste" ? "cell" : "default",
             }}
             onMouseLeave={() => {
-              if (tool !== "select") setTool("select");
-              setCtxMenu(null);
+              // reset tool, but keep context menu until click-outside
+              if (tool !== "select" && !ctxMenu) setTool("select");
             }}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -1430,8 +1649,50 @@ export function App() {
       </footer>
 
 
+
+      {showWelcome && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.72)",
+          display: "flex", alignItems: "center", justifyContent: "center", zIndex: 150,
+        }}>
+          <div style={{
+            background: "#151a22", border: "1px solid #333", borderRadius: 12,
+            padding: 28, width: 420, maxWidth: "92vw",
+          }}>
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, color: "#5b8def" }}>
+              AILEXSI Resonance Studio
+            </div>
+            <p className="muted" style={{ lineHeight: 1.55, marginBottom: 18, fontSize: 13 }}>
+              Local-first. Media is stored in this browser so reload keeps your files.
+              Import video + audio to start, or open a saved project.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <button type="button" onClick={() => {
+                setShowWelcome(false);
+                document.getElementById("file-input")?.click();
+              }} style={{
+                padding: "10px 14px", borderRadius: 8, border: "none",
+                background: "#5b8def", color: "#fff", fontWeight: 600, cursor: "pointer",
+              }}>Import media</button>
+              <button type="button" onClick={() => {
+                setShowWelcome(false);
+                openInputRef.current?.click();
+              }} style={{
+                padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+                background: "transparent", color: "#e8eaed", cursor: "pointer",
+              }}>Open project (.json)</button>
+              <button type="button" onClick={() => setShowWelcome(false)} style={{
+                padding: "8px", border: "none", background: "transparent",
+                color: "#8b93a7", cursor: "pointer", fontSize: 12,
+              }}>Continue empty</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {ctxMenu && (
         <div
+          id="rs-ctx-menu"
           style={{
             position: "fixed",
             left: ctxMenu.x,
@@ -1444,7 +1705,6 @@ export function App() {
             minWidth: 160,
             boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
           }}
-          onMouseLeave={() => setCtxMenu(null)}
         >
           {([
             ["select", "↖  Select / Move"],
@@ -1454,11 +1714,12 @@ export function App() {
             <button
               key={id}
               type="button"
-              onClick={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
                 setTool(id);
                 setCtxMenu(null);
-                if (id === "copy") copySelectedClip();
-                if (id === "paste") pasteClipAtPlayhead();
+                flash(id === "select" ? "Select tool" : id === "copy" ? "Copy tool — click a clip" : "Paste tool — click timeline");
               }}
               style={{
                 display: "block",
@@ -1479,14 +1740,14 @@ export function App() {
           <div style={{ height: 1, background: "#333", margin: "4px 0" }} />
           <button
             type="button"
-            onClick={() => { copySelectedClip(); setCtxMenu(null); }}
+            onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); copySelectedClip(); setCtxMenu(null); }}
             style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", border: "none", borderRadius: 6, background: "transparent", color: "#e8eaed", cursor: "pointer", fontSize: 12 }}
           >
             Copy selected (Ctrl+C)
           </button>
           <button
             type="button"
-            onClick={() => { pasteClipAtPlayhead(); setCtxMenu(null); }}
+            onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); pasteClipAtPlayhead(); setCtxMenu(null); }}
             style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", border: "none", borderRadius: 6, background: "transparent", color: "#e8eaed", cursor: "pointer", fontSize: 12 }}
           >
             Paste at playhead (Ctrl+V)
