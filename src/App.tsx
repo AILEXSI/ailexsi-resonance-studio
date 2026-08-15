@@ -33,6 +33,10 @@ export function App() {
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [targetTrackId, setTargetTrackId] = useState<string | null>(null);
+  type EditorTool = "select" | "copy" | "paste";
+  const [tool, setTool] = useState<EditorTool>("select");
+  const [clipClipboard, setClipClipboard] = useState<Clip | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [pendingProposal, setPendingProposal] = useState<ProjectEditProposal | null>(null);
   const [playError, setPlayError] = useState<string | null>(null);
@@ -46,8 +50,10 @@ export function App() {
   const dragRef = useRef<{
     clipId: string;
     startX: number;
+    startY: number;
     origStartMs: number;
     durationMs: number;
+    fromTrackId: string;
   } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -683,19 +689,45 @@ export function App() {
     e.preventDefault();
     setSelectedClipId(clip.id);
     setTargetTrackId(clip.trackId);
+    setCtxMenu(null);
+
+    if (tool === "copy") {
+      setClipClipboard({ ...clip, id: clip.id });
+      flash("Copied");
+      setTool("select");
+      return;
+    }
+
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
     dragRef.current = {
       clipId: clip.id,
       startX: e.clientX,
+      startY: e.clientY,
       origStartMs: clip.range.startMs,
       durationMs: clip.range.endMs - clip.range.startMs,
+      fromTrackId: clip.trackId,
     };
-  }, []);
+  }, [tool]);
+
+  const findTrackAtY = useCallback((clientY: number): Track | null => {
+    const canvas = timelineLaneRef.current;
+    if (!canvas) return null;
+    const lanes = canvas.querySelectorAll<HTMLElement>(".track-lane");
+    for (const lane of lanes) {
+      const r = lane.getBoundingClientRect();
+      if (clientY >= r.top && clientY <= r.bottom) {
+        const id = lane.dataset.trackId;
+        return project.tracks.find((t) => t.id === id) ?? null;
+      }
+    }
+    return null;
+  }, [project.tracks]);
 
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
       if (!dragRef.current || !timelineLaneRef.current) return;
-      const laneWidth = timelineLaneRef.current.getBoundingClientRect().width;
+      const canvas = timelineLaneRef.current;
+      const laneWidth = canvas.getBoundingClientRect().width;
       const dx = e.clientX - dragRef.current.startX;
       const dMs = (dx / laneWidth) * duration;
       const newStart = Math.max(0, dragRef.current.origStartMs + dMs);
@@ -714,7 +746,39 @@ export function App() {
         })),
       }));
     };
-    const onUp = () => {
+    const onUp = (e: PointerEvent) => {
+      if (!dragRef.current) return;
+      const { clipId, fromTrackId } = dragRef.current;
+      const over = findTrackAtY(e.clientY);
+      if (over && over.id !== fromTrackId) {
+        setProject((p) => {
+          const from = p.tracks.find((t) => t.id === fromTrackId);
+          const clip = from?.clips.find((c) => c.id === clipId);
+          if (!clip || !from) return p;
+          // only same kind (video↔video, audio↔audio)
+          if (from.kind !== over.kind) {
+            flash(`Cannot move ${from.kind} → ${over.kind}`);
+            return p;
+          }
+          return {
+            ...p,
+            tracks: p.tracks.map((t) => {
+              if (t.id === fromTrackId) {
+                return { ...t, clips: t.clips.filter((c) => c.id !== clipId) };
+              }
+              if (t.id === over.id) {
+                return {
+                  ...t,
+                  clips: [...t.clips, { ...clip, trackId: over.id }],
+                };
+              }
+              return t;
+            }),
+          };
+        });
+        setTargetTrackId(over.id);
+        flash(`Moved → ${over.name}`);
+      }
       dragRef.current = null;
     };
     window.addEventListener("pointermove", onMove);
@@ -723,7 +787,51 @@ export function App() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [duration]);
+  }, [duration, findTrackAtY]);
+
+  const copySelectedClip = useCallback(() => {
+    if (!selectedClipId) return;
+    for (const t of project.tracks) {
+      const c = t.clips.find((x) => x.id === selectedClipId);
+      if (c) {
+        setClipClipboard({ ...c });
+        flash("Copied");
+        return;
+      }
+    }
+  }, [selectedClipId, project.tracks]);
+
+  const pasteClipAtPlayhead = useCallback(() => {
+    if (!clipClipboard) {
+      flash("Clipboard empty");
+      return;
+    }
+    const kind = project.tracks.find((t) => t.id === clipClipboard.trackId)?.kind
+      ?? project.tracks.find((t) => t.id === (targetTrackId ?? ""))?.kind
+      ?? "VIDEO";
+    const track =
+      project.tracks.find((t) => t.id === targetTrackId && t.kind === kind) ??
+      project.tracks.find((t) => t.kind === kind)!;
+    const dur = clipClipboard.range.endMs - clipClipboard.range.startMs;
+    const startMs = project.playheadMs;
+    const newClip: Clip = {
+      ...clipClipboard,
+      id: crypto.randomUUID(),
+      trackId: track.id,
+      range: { startMs, endMs: startMs + dur },
+      label: (clipClipboard.label || "clip") + " copy",
+    };
+    setProject((p) => ({
+      ...p,
+      durationMs: Math.max(p.durationMs, startMs + dur),
+      tracks: p.tracks.map((t) =>
+        t.id === track.id ? { ...t, clips: [...t.clips, newClip] } : t
+      ),
+    }));
+    setSelectedClipId(newClip.id);
+    flash(`Pasted on ${track.name}`);
+    setTool("select");
+  }, [clipClipboard, project.playheadMs, project.tracks, targetTrackId]);
 
 
   const addMarkerAtPlayhead = useCallback(() => {
@@ -867,10 +975,22 @@ export function App() {
         e.preventDefault();
         downloadProject();
       }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "c" || e.key === "C")) {
+        e.preventDefault();
+        copySelectedClip();
+      }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "v" || e.key === "V")) {
+        e.preventDefault();
+        pasteClipAtPlayhead();
+      }
+      if (e.key === "Escape") {
+        setTool("select");
+        setCtxMenu(null);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject, addMarkerAtPlayhead]);
+  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject, addMarkerAtPlayhead, copySelectedClip, pasteClipAtPlayhead]);
 
   return (
     <div className="app">
@@ -913,7 +1033,7 @@ export function App() {
         />
         <div className="project-name">{project.name}</div>
         <div className="ai-status ready">
-          {statusMsg ?? `AI ready · Vault: ${vaultStatus.mode}`}
+          {statusMsg ?? `Tool: ${tool} · Vault: ${vaultStatus.mode}`}
         </div>
       </header>
 
@@ -1159,8 +1279,8 @@ export function App() {
           <p className="muted" style={{ marginBottom: 16, lineHeight: 1.55, fontSize: 12 }}>
             <strong>Shortcuts</strong><br />
             Space Play/Pause · C Cut · M Marker · Del Delete<br />
-            Ctrl+S Save · Multi-import supported<br />
-            V2 overlays V1 · Re-import restores media
+            Ctrl+C / Ctrl+V · Right-click tools<br />
+            Drag clip to other track (same kind)
           </p>
         )}
         {selectedClipId && (
@@ -1198,7 +1318,28 @@ export function App() {
               </div>
             ))}
           </div>
-          <div className="timeline-canvas" ref={timelineLaneRef}>
+          <div
+            className="timeline-canvas"
+            ref={timelineLaneRef}
+            style={{
+              cursor:
+                tool === "copy" ? "copy" : tool === "paste" ? "cell" : "default",
+            }}
+            onMouseLeave={() => {
+              if (tool !== "select") setTool("select");
+              setCtxMenu(null);
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu({ x: e.clientX, y: e.clientY });
+            }}
+            onClick={() => {
+              if (tool === "paste" && clipClipboard) {
+                pasteClipAtPlayhead();
+              }
+              setCtxMenu(null);
+            }}
+          >
             <div className="timeline-ruler" onClick={onTimelineClick}>
               {[0, 0.25, 0.5, 0.75, 1].map((p) => (
                 <span
@@ -1220,9 +1361,14 @@ export function App() {
                 <div
                   key={track.id}
                   className="track-lane"
+                  data-track-id={track.id}
                   onClick={(e) => {
                     setTargetTrackId(track.id);
                     onTimelineClick(e);
+                    if (tool === "paste" && clipClipboard) {
+                      e.stopPropagation();
+                      pasteClipAtPlayhead();
+                    }
                   }}
                 >
                   {track.clips.map((clip) => {
@@ -1282,6 +1428,71 @@ export function App() {
           Propose
         </button>
       </footer>
+
+
+      {ctxMenu && (
+        <div
+          style={{
+            position: "fixed",
+            left: ctxMenu.x,
+            top: ctxMenu.y,
+            zIndex: 200,
+            background: "#1a1f27",
+            border: "1px solid #333",
+            borderRadius: 8,
+            padding: 4,
+            minWidth: 160,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+          }}
+          onMouseLeave={() => setCtxMenu(null)}
+        >
+          {([
+            ["select", "↖  Select / Move"],
+            ["copy", "❐  Copy tool"],
+            ["paste", "⧉  Paste tool"],
+          ] as [EditorTool, string][]).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => {
+                setTool(id);
+                setCtxMenu(null);
+                if (id === "copy") copySelectedClip();
+                if (id === "paste") pasteClipAtPlayhead();
+              }}
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                padding: "8px 12px",
+                border: "none",
+                borderRadius: 6,
+                background: tool === id ? "#2a3548" : "transparent",
+                color: "#e8eaed",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+          <div style={{ height: 1, background: "#333", margin: "4px 0" }} />
+          <button
+            type="button"
+            onClick={() => { copySelectedClip(); setCtxMenu(null); }}
+            style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", border: "none", borderRadius: 6, background: "transparent", color: "#e8eaed", cursor: "pointer", fontSize: 12 }}
+          >
+            Copy selected (Ctrl+C)
+          </button>
+          <button
+            type="button"
+            onClick={() => { pasteClipAtPlayhead(); setCtxMenu(null); }}
+            style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", border: "none", borderRadius: 6, background: "transparent", color: "#e8eaed", cursor: "pointer", fontSize: 12 }}
+          >
+            Paste at playhead (Ctrl+V)
+          </button>
+        </div>
+      )}
 
       {showExportDlg && (
         <div style={{
