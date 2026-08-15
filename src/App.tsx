@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createEmptyProject,
+  ensureMultiTrack,
   type Project,
   type ProjectEditProposal,
   type MediaAsset,
   type Clip,
+  type Track,
 } from "./core/models";
 import { generateProposal, applyProposal, rejectProposal } from "./core/ai-command";
 import { loadProject, saveProject } from "./core/project-store";
@@ -18,16 +20,23 @@ function formatTime(ms: number): string {
   return `${m}:${s.toString().padStart(2, "0")}.${cs.toString().padStart(2, "0")}`;
 }
 
+function clipAt(track: Track, timeMs: number): Clip | null {
+  return (
+    track.clips.find((c) => timeMs >= c.range.startMs && timeMs < c.range.endMs) ?? null
+  );
+}
+
 export function App() {
-  const [project, setProject] = useState<Project>(() => loadProject());
+  const [project, setProject] = useState<Project>(() => ensureMultiTrack(loadProject()));
   const [command, setCommand] = useState("");
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [targetTrackId, setTargetTrackId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [pendingProposal, setPendingProposal] = useState<ProjectEditProposal | null>(null);
   const [playError, setPlayError] = useState<string | null>(null);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
-  // Drag state
   const dragRef = useRef<{
     clipId: string;
     startX: number;
@@ -36,48 +45,71 @@ export function App() {
   } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const audio1Ref = useRef<HTMLAudioElement>(null);
+  const audio2Ref = useRef<HTMLAudioElement>(null);
   const rafRef = useRef<number>(0);
   const lastTick = useRef<number>(0);
   const isSeekingRef = useRef(false);
   const timelineLaneRef = useRef<HTMLDivElement>(null);
+  const openInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     saveProject(project);
   }, [project]);
 
+  const flash = (msg: string) => {
+    setStatusMsg(msg);
+    setTimeout(() => setStatusMsg(null), 2200);
+  };
+
   const duration = Math.max(project.durationMs, 1000);
 
-  const selectedAsset = useMemo(
-    () => project.mediaAssets.find((a) => a.id === selectedAssetId) ?? null,
-    [project.mediaAssets, selectedAssetId]
+  const videoTracks = useMemo(
+    () => project.tracks.filter((t) => t.kind === "VIDEO"),
+    [project.tracks]
+  );
+  const audioTracks = useMemo(
+    () => project.tracks.filter((t) => t.kind === "AUDIO"),
+    [project.tracks]
   );
 
-  // Active video clip under playhead
+  // Topmost video track with a clip under playhead (V2 over V1 — later tracks win)
   const activeVideoClip = useMemo(() => {
-    const videoTrack = project.tracks.find((t) => t.kind === "VIDEO");
-    if (!videoTrack) return null;
-    return (
-      videoTrack.clips.find(
-        (c) =>
-          project.playheadMs >= c.range.startMs &&
-          project.playheadMs < c.range.endMs
-      ) ?? null
-    );
-  }, [project.tracks, project.playheadMs]);
+    for (let i = videoTracks.length - 1; i >= 0; i--) {
+      const c = clipAt(videoTracks[i], project.playheadMs);
+      if (c) return c;
+    }
+    return null;
+  }, [videoTracks, project.playheadMs]);
 
   const activeVideoAsset = useMemo(() => {
-    if (!activeVideoClip?.mediaAssetId) {
-      // fallback: first video asset
-      return project.mediaAssets.find((a) => a.type === "video") ?? null;
-    }
-    return (
-      project.mediaAssets.find((a) => a.id === activeVideoClip.mediaAssetId) ?? null
-    );
+    if (!activeVideoClip?.mediaAssetId) return null;
+    return project.mediaAssets.find((a) => a.id === activeVideoClip.mediaAssetId) ?? null;
   }, [activeVideoClip, project.mediaAssets]);
 
-  const audioAsset = project.mediaAssets.find((a) => a.type === "audio") ?? null;
-  const muteVideo = !!audioAsset;
+  // Active audio clip per audio track
+  const activeAudioClips = useMemo(() => {
+    return audioTracks.map((t) => ({
+      track: t,
+      clip: clipAt(t, project.playheadMs),
+    }));
+  }, [audioTracks, project.playheadMs]);
+
+  const audioAssetsForTracks = useMemo(() => {
+    return activeAudioClips.map(({ clip }) => {
+      if (!clip?.mediaAssetId) return null;
+      return project.mediaAssets.find((a) => a.id === clip.mediaAssetId) ?? null;
+    });
+  }, [activeAudioClips, project.mediaAssets]);
+
+  const hasAnyAudio = audioAssetsForTracks.some(Boolean);
+  const muteVideo = hasAnyAudio;
+
+  const defaultTargetTrack = targetTrackId
+    ?? videoTracks[0]?.id
+    ?? audioTracks[0]?.id
+    ?? project.tracks[0]?.id
+    ?? null;
 
   // ---------- SEEK ----------
   const seekTo = useCallback(
@@ -85,96 +117,91 @@ export function App() {
       const clamped = Math.max(0, Math.min(duration, ms));
       isSeekingRef.current = true;
       setProject((p) => ({ ...p, playheadMs: clamped }));
-      const t = clamped / 1000;
-      if (videoRef.current) {
-        try {
-          // Map timeline time → source time inside the active clip
-          const clip = activeVideoClip;
-          if (clip && clip.sourceRange) {
-            const offset = clamped - clip.range.startMs;
-            const srcT = (clip.sourceRange.startMs + offset) / 1000;
-            videoRef.current.currentTime = Math.max(0, srcT);
-          } else {
-            videoRef.current.currentTime = t;
+
+      const applyVideo = () => {
+        const v = videoRef.current;
+        if (!v) return;
+        // find active clip at clamped time
+        const vTracks = project.tracks.filter((t) => t.kind === "VIDEO");
+        let clip: Clip | null = null;
+        for (let i = vTracks.length - 1; i >= 0; i--) {
+          const c = clipAt(vTracks[i], clamped);
+          if (c) {
+            clip = c;
+            break;
           }
-        } catch {
-          /* */
         }
-      }
-      if (audioRef.current) {
-        try {
-          audioRef.current.currentTime = t;
-        } catch {
-          /* */
+        if (clip?.sourceRange) {
+          const offset = clamped - clip.range.startMs;
+          try {
+            v.currentTime = Math.max(0, (clip.sourceRange.startMs + offset) / 1000);
+          } catch { /* */ }
         }
-      }
+      };
+      applyVideo();
+
+      // audio elements: set to timeline time mapped through clip
+      const syncAudio = (el: HTMLAudioElement | null, track: Track | undefined) => {
+        if (!el || !track) return;
+        const c = clipAt(track, clamped);
+        if (c?.sourceRange) {
+          const offset = clamped - c.range.startMs;
+          try {
+            el.currentTime = Math.max(0, (c.sourceRange.startMs + offset) / 1000);
+          } catch { /* */ }
+        } else {
+          try {
+            el.currentTime = clamped / 1000;
+          } catch { /* */ }
+        }
+      };
+      syncAudio(audio1Ref.current, audioTracks[0]);
+      syncAudio(audio2Ref.current, audioTracks[1]);
+
       requestAnimationFrame(() => {
         isSeekingRef.current = false;
       });
     },
-    [duration, activeVideoClip]
+    [duration, project.tracks, audioTracks]
   );
 
   // ---------- PLAYBACK ----------
   const startPlayback = useCallback(async () => {
     setPlayError(null);
     const v = videoRef.current;
-    const a = audioRef.current;
-
-    if (v) {
-      v.muted = muteVideo;
-      // Align source time for active clip
-      const clip = activeVideoClip;
-      if (clip && clip.sourceRange) {
-        const offset = project.playheadMs - clip.range.startMs;
-        try {
-          v.currentTime = Math.max(0, (clip.sourceRange.startMs + offset) / 1000);
-        } catch {
-          /* */
-        }
-      }
-    }
-    if (a) {
-      try {
-        a.currentTime = project.playheadMs / 1000;
-      } catch {
-        /* */
-      }
-    }
+    if (v) v.muted = muteVideo;
 
     const promises: Promise<void>[] = [];
-    if (v) {
+    if (v && activeVideoAsset) {
       promises.push(
         v.play().catch((err) => {
-          console.warn("[Resonance] video.play() failed:", err);
-          setPlayError("Video play blocked: " + (err?.message || String(err)));
+          console.warn("[Resonance] video.play()", err);
+          setPlayError("Video: " + (err?.message || String(err)));
           throw err;
         })
       );
     }
-    if (a) {
-      promises.push(
-        a.play().catch((err) => {
-          console.warn("[Resonance] audio.play() failed:", err);
-          setPlayError("Audio play blocked: " + (err?.message || String(err)));
-          throw err;
-        })
-      );
+    const a1 = audio1Ref.current;
+    const a2 = audio2Ref.current;
+    if (a1 && audioAssetsForTracks[0]) {
+      promises.push(a1.play().catch((err) => console.warn("audio1", err)));
+    }
+    if (a2 && audioAssetsForTracks[1]) {
+      promises.push(a2.play().catch((err) => console.warn("audio2", err)));
     }
 
     try {
-      await Promise.all(promises);
+      await Promise.allSettled(promises);
       setIsPlaying(true);
     } catch {
-      if (v && !v.paused) setIsPlaying(true);
-      else if (a && !a.paused) setIsPlaying(true);
-      else setIsPlaying(false);
+      setIsPlaying(true);
     }
-  }, [project.playheadMs, muteVideo, activeVideoClip]);
+  }, [muteVideo, activeVideoAsset, audioAssetsForTracks]);
 
   const stopPlayback = useCallback(() => {
     videoRef.current?.pause();
-    audioRef.current?.pause();
+    audio1Ref.current?.pause();
+    audio2Ref.current?.pause();
     setIsPlaying(false);
   }, []);
 
@@ -186,23 +213,6 @@ export function App() {
   useEffect(() => {
     if (videoRef.current) videoRef.current.muted = muteVideo;
   }, [muteVideo, activeVideoAsset?.id]);
-
-  // When active clip changes during playback, switch video source time
-  useEffect(() => {
-    if (!isPlaying || !videoRef.current || !activeVideoClip) return;
-    const clip = activeVideoClip;
-    if (!clip.sourceRange) return;
-    const offset = project.playheadMs - clip.range.startMs;
-    const srcT = (clip.sourceRange.startMs + Math.max(0, offset)) / 1000;
-    try {
-      if (Math.abs(videoRef.current.currentTime - srcT) > 0.25) {
-        videoRef.current.currentTime = srcT;
-        if (isPlaying) videoRef.current.play().catch(() => {});
-      }
-    } catch {
-      /* */
-    }
-  }, [activeVideoClip?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // rAF clock
   useEffect(() => {
@@ -219,39 +229,51 @@ export function App() {
         const next = Math.min(p.playheadMs + dt, max);
 
         if (!isSeekingRef.current) {
-          // Keep audio in sync with timeline
-          const a = audioRef.current;
-          if (a && Math.abs(a.currentTime - next / 1000) > 0.2) {
-            try {
-              a.currentTime = next / 1000;
-            } catch {
-              /* */
-            }
-          }
-          // Video sync handled via active clip mapping
+          const vTracks = p.tracks.filter((t) => t.kind === "VIDEO");
+          const aTracks = p.tracks.filter((t) => t.kind === "AUDIO");
+
           const v = videoRef.current;
           if (v) {
-            const vTrack = p.tracks.find((t) => t.kind === "VIDEO");
-            const clip = vTrack?.clips.find(
-              (c) => next >= c.range.startMs && next < c.range.endMs
-            );
+            let clip: Clip | null = null;
+            for (let i = vTracks.length - 1; i >= 0; i--) {
+              const c = clipAt(vTracks[i], next);
+              if (c) {
+                clip = c;
+                break;
+              }
+            }
             if (clip?.sourceRange) {
               const offset = next - clip.range.startMs;
               const srcT = (clip.sourceRange.startMs + offset) / 1000;
               if (Math.abs(v.currentTime - srcT) > 0.25) {
                 try {
                   v.currentTime = srcT;
-                } catch {
-                  /* */
-                }
+                } catch { /* */ }
               }
             }
           }
+
+          const syncA = (el: HTMLAudioElement | null, track: Track | undefined) => {
+            if (!el || !track) return;
+            const c = clipAt(track, next);
+            if (c?.sourceRange) {
+              const offset = next - c.range.startMs;
+              const srcT = (c.sourceRange.startMs + offset) / 1000;
+              if (Math.abs(el.currentTime - srcT) > 0.25) {
+                try {
+                  el.currentTime = srcT;
+                } catch { /* */ }
+              }
+            }
+          };
+          syncA(audio1Ref.current, aTracks[0]);
+          syncA(audio2Ref.current, aTracks[1]);
         }
 
         if (next >= max) {
           videoRef.current?.pause();
-          audioRef.current?.pause();
+          audio1Ref.current?.pause();
+          audio2Ref.current?.pause();
           setIsPlaying(false);
           return { ...p, playheadMs: max };
         }
@@ -263,102 +285,99 @@ export function App() {
     return () => cancelAnimationFrame(rafRef.current);
   }, [isPlaying, duration]);
 
-  // ---------- IMPORT (always APPENDS a new clip) ----------
-  const handleImport = useCallback(async (files: FileList | null) => {
-    if (!files?.length) return;
-    const file = files[0];
-    const url = URL.createObjectURL(file);
-    const isVideo = file.type.startsWith("video/");
-    const isAudio = file.type.startsWith("audio/");
-    if (!isVideo && !isAudio) return;
+  // ---------- IMPORT ----------
+  const handleImport = useCallback(
+    async (files: FileList | null) => {
+      if (!files?.length) return;
+      const file = files[0];
+      const url = URL.createObjectURL(file);
+      const isVideo = file.type.startsWith("video/");
+      const isAudio = file.type.startsWith("audio/");
+      if (!isVideo && !isAudio) return;
 
-    let durationMs = 5000;
-    if (isVideo) {
-      const v = document.createElement("video");
-      v.preload = "metadata";
-      v.src = url;
-      await new Promise<void>((res) => {
-        v.onloadedmetadata = () => {
-          durationMs = Math.max(200, (v.duration || 5) * 1000);
-          res();
-        };
-        v.onerror = () => res();
-      });
-    } else {
-      const a = document.createElement("audio");
-      a.preload = "metadata";
-      a.src = url;
-      await new Promise<void>((res) => {
-        a.onloadedmetadata = () => {
-          durationMs = Math.max(200, (a.duration || 5) * 1000);
-          res();
-        };
-        a.onerror = () => res();
-      });
-    }
+      let durationMs = 5000;
+      if (isVideo) {
+        const v = document.createElement("video");
+        v.preload = "metadata";
+        v.src = url;
+        await new Promise<void>((res) => {
+          v.onloadedmetadata = () => {
+            durationMs = Math.max(200, (v.duration || 5) * 1000);
+            res();
+          };
+          v.onerror = () => res();
+        });
+      } else {
+        const a = document.createElement("audio");
+        a.preload = "metadata";
+        a.src = url;
+        await new Promise<void>((res) => {
+          a.onloadedmetadata = () => {
+            durationMs = Math.max(200, (a.duration || 5) * 1000);
+            res();
+          };
+          a.onerror = () => res();
+        });
+      }
 
-    const asset: MediaAsset = {
-      id: crypto.randomUUID(),
-      type: isVideo ? "video" : "audio",
-      name: file.name,
-      localPathOrUrl: url,
-      durationMs,
-      analysis: isAudio
-        ? { waveformPeaks: Array.from({ length: 64 }, () => 0.25 + Math.random() * 0.7) }
-        : { width: 0, height: 0 },
-    };
-
-    const beatMarkers = Array.from({ length: Math.floor(durationMs / 500) + 1 }, (_, i) => ({
-      id: crypto.randomUUID(),
-      timeMs: i * 500,
-      label: `beat ${i + 1}`,
-      kind: "beat" as const,
-    }));
-
-    const trackKind = isVideo ? "VIDEO" : "AUDIO";
-
-    setProject((p) => {
-      const track = p.tracks.find((t) => t.kind === trackKind)!;
-      // Place new clip after the last clip on this track (or at 0)
-      const lastEnd = track.clips.reduce((m, c) => Math.max(m, c.range.endMs), 0);
-      const startMs = lastEnd;
-
-      const clip: Clip = {
+      const asset: MediaAsset = {
         id: crypto.randomUUID(),
-        trackId: track.id,
-        mediaAssetId: asset.id,
-        range: { startMs, endMs: startMs + durationMs },
-        sourceRange: { startMs: 0, endMs: durationMs },
-        label: file.name,
+        type: isVideo ? "video" : "audio",
+        name: file.name,
+        localPathOrUrl: url,
+        durationMs,
+        analysis: isAudio
+          ? { waveformPeaks: Array.from({ length: 64 }, () => 0.25 + Math.random() * 0.7) }
+          : { width: 0, height: 0 },
       };
 
-      return {
-        ...p,
-        mediaAssets: [...p.mediaAssets, asset],
-        durationMs: Math.max(p.durationMs, startMs + durationMs),
-        tracks: p.tracks.map((t) =>
-          t.id === track.id ? { ...t, clips: [...t.clips, clip] } : t
-        ),
-        markers:
-          isAudio
-            ? [...p.markers.filter((m) => m.kind !== "beat"), ...beatMarkers]
-            : p.markers,
-      };
-    });
+      setProject((p) => {
+        const kind = isVideo ? "VIDEO" : "AUDIO";
+        // Prefer selected target track if matching kind, else first free / first of kind
+        let track =
+          p.tracks.find((t) => t.id === targetTrackId && t.kind === kind) ??
+          p.tracks.find((t) => t.kind === kind && t.clips.length === 0) ??
+          p.tracks.find((t) => t.kind === kind)!;
 
-    setSelectedAssetId(asset.id);
-    setIsPlaying(false);
-    setPlayError(null);
-  }, []);
+        const lastEnd = track.clips.reduce((m, c) => Math.max(m, c.range.endMs), 0);
+        const startMs = lastEnd;
 
-  // Place existing media asset onto timeline at playhead
+        const clip: Clip = {
+          id: crypto.randomUUID(),
+          trackId: track.id,
+          mediaAssetId: asset.id,
+          range: { startMs, endMs: startMs + durationMs },
+          sourceRange: { startMs: 0, endMs: durationMs },
+          label: file.name,
+        };
+
+        return {
+          ...p,
+          mediaAssets: [...p.mediaAssets, asset],
+          durationMs: Math.max(p.durationMs, startMs + durationMs),
+          tracks: p.tracks.map((t) =>
+            t.id === track.id ? { ...t, clips: [...t.clips, clip] } : t
+          ),
+        };
+      });
+
+      setSelectedAssetId(asset.id);
+      setIsPlaying(false);
+      setPlayError(null);
+      flash(`Imported ${file.name}`);
+    },
+    [targetTrackId]
+  );
+
   const addAssetToTimeline = useCallback(
-    (assetId: string) => {
+    (assetId: string, trackId?: string) => {
       const asset = project.mediaAssets.find((a) => a.id === assetId);
       if (!asset) return;
-      const trackKind = asset.type === "video" ? "VIDEO" : "AUDIO";
+      const kind = asset.type === "video" ? "VIDEO" : "AUDIO";
       setProject((p) => {
-        const track = p.tracks.find((t) => t.kind === trackKind)!;
+        const track =
+          p.tracks.find((t) => t.id === (trackId || targetTrackId) && t.kind === kind) ??
+          p.tracks.find((t) => t.kind === kind)!;
         const startMs = p.playheadMs;
         const clip: Clip = {
           id: crypto.randomUUID(),
@@ -376,26 +395,71 @@ export function App() {
           ),
         };
       });
+      flash("Clip placed at playhead");
     },
-    [project.mediaAssets]
+    [project.mediaAssets, targetTrackId]
   );
 
-  // ---------- CLIP DRAG ----------
-  const onClipPointerDown = useCallback(
-    (e: React.PointerEvent, clip: Clip) => {
-      e.stopPropagation();
-      e.preventDefault();
-      setSelectedClipId(clip.id);
-      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
-      dragRef.current = {
-        clipId: clip.id,
-        startX: e.clientX,
-        origStartMs: clip.range.startMs,
-        durationMs: clip.range.endMs - clip.range.startMs,
+  // ---------- SAVE / OPEN / EXPORT ----------
+  const downloadProject = useCallback(
+    (filename?: string) => {
+      // Strip blob URLs — they won't work after reload; keep metadata
+      const portable: Project = {
+        ...project,
+        mediaAssets: project.mediaAssets.map((a) => ({
+          ...a,
+          localPathOrUrl: a.localPathOrUrl.startsWith("blob:")
+            ? `missing:${a.name}`
+            : a.localPathOrUrl,
+        })),
+        updatedAt: new Date().toISOString(),
       };
+      const blob = new Blob([JSON.stringify(portable, null, 2)], {
+        type: "application/json",
+      });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download =
+        filename ||
+        `${(project.name || "resonance").replace(/\s+/g, "_")}.resonance.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      flash("Project saved (.resonance.json)");
     },
-    []
+    [project]
   );
+
+  const openProjectFile = useCallback(async (files: FileList | null) => {
+    if (!files?.length) return;
+    const text = await files[0].text();
+    try {
+      const parsed = JSON.parse(text) as Project;
+      if (!parsed.id || !Array.isArray(parsed.tracks)) throw new Error("Invalid project");
+      stopPlayback();
+      setProject(ensureMultiTrack(parsed));
+      setSelectedClipId(null);
+      setPendingProposal(null);
+      flash("Project opened — re-import media if blobs were local");
+    } catch (e) {
+      flash("Open failed: invalid project file");
+      console.warn(e);
+    }
+  }, [stopPlayback]);
+
+  // ---------- CLIP DRAG ----------
+  const onClipPointerDown = useCallback((e: React.PointerEvent, clip: Clip) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setSelectedClipId(clip.id);
+    setTargetTrackId(clip.trackId);
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    dragRef.current = {
+      clipId: clip.id,
+      startX: e.clientX,
+      origStartMs: clip.range.startMs,
+      durationMs: clip.range.endMs - clip.range.startMs,
+    };
+  }, []);
 
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
@@ -406,7 +470,6 @@ export function App() {
       const newStart = Math.max(0, dragRef.current.origStartMs + dMs);
       const dur = dragRef.current.durationMs;
       const clipId = dragRef.current.clipId;
-
       setProject((p) => ({
         ...p,
         durationMs: Math.max(p.durationMs, newStart + dur),
@@ -420,11 +483,9 @@ export function App() {
         })),
       }));
     };
-
     const onUp = () => {
       dragRef.current = null;
     };
-
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     return () => {
@@ -433,7 +494,7 @@ export function App() {
     };
   }, [duration]);
 
-  // ---------- SPLIT AT PLAYHEAD ----------
+  // ---------- SPLIT / DELETE ----------
   const splitAtPlayhead = useCallback(() => {
     const ph = project.playheadMs;
     setProject((p) => {
@@ -450,10 +511,7 @@ export function App() {
               ...c,
               id: crypto.randomUUID(),
               range: { startMs: c.range.startMs, endMs: ph },
-              sourceRange: {
-                startMs: srcStart,
-                endMs: srcStart + leftDur,
-              },
+              sourceRange: { startMs: srcStart, endMs: srcStart + leftDur },
               label: (c.label || "") + " (A)",
             });
             newClips.push({
@@ -474,9 +532,9 @@ export function App() {
       });
       return changed ? { ...p, tracks } : p;
     });
+    flash("Cut at playhead");
   }, [project.playheadMs]);
 
-  // ---------- DELETE SELECTED CLIP ----------
   const deleteSelectedClip = useCallback(() => {
     if (!selectedClipId) return;
     setProject((p) => ({
@@ -487,9 +545,9 @@ export function App() {
       })),
     }));
     setSelectedClipId(null);
+    flash("Clip deleted");
   }, [selectedClipId]);
 
-  // ---------- Timeline click (seek) ----------
   const onTimelineClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current) return;
@@ -521,6 +579,7 @@ export function App() {
     });
     setProject(next);
     setPendingProposal(null);
+    flash("Proposal applied");
   };
 
   const onReject = () => {
@@ -532,7 +591,6 @@ export function App() {
   const playheadPct = Math.min(100, (project.playheadMs / duration) * 100);
   const vaultStatus = localOnlyVaultAdapter.getStatus();
 
-  // Keyboard
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === "INPUT") return;
@@ -548,30 +606,52 @@ export function App() {
         e.preventDefault();
         deleteSelectedClip();
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+        e.preventDefault();
+        downloadProject();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, splitAtPlayhead, deleteSelectedClip]);
+  }, [togglePlay, splitAtPlayhead, deleteSelectedClip, downloadProject]);
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="logo">AILEXSI Resonance</div>
         <nav>
-          <button type="button" title="Next slice">Project</button>
-          <button type="button" title="Next slice">File</button>
-          <button type="button" onClick={splitAtPlayhead} title="Split at playhead (C)">
-            Cut
-          </button>
-          <button type="button" onClick={deleteSelectedClip} title="Delete selected clip">
-            Delete
-          </button>
-          <button type="button" title="Next slice">AI</button>
-          <button type="button" title="Next slice">View</button>
-          <button type="button" title="Next slice">Export</button>
+          <button type="button" onClick={() => {
+            stopPlayback();
+            project.mediaAssets.forEach((a) => {
+              if (a.localPathOrUrl.startsWith("blob:")) {
+                try { URL.revokeObjectURL(a.localPathOrUrl); } catch { /* */ }
+              }
+            });
+            setProject(createEmptyProject("New Resonance"));
+            setSelectedAssetId(null);
+            setSelectedClipId(null);
+            setPendingProposal(null);
+            flash("New project");
+          }}>New</button>
+          <button type="button" onClick={() => openInputRef.current?.click()}>Open</button>
+          <button type="button" onClick={() => downloadProject()}>Save</button>
+          <button type="button" onClick={() => downloadProject(
+            `${(project.name || "export").replace(/\s+/g, "_")}_export.resonance.json`
+          )}>Export</button>
+          <button type="button" onClick={splitAtPlayhead} title="C">Cut</button>
+          <button type="button" onClick={deleteSelectedClip}>Delete</button>
         </nav>
+        <input
+          ref={openInputRef}
+          type="file"
+          accept=".json,.resonance.json,application/json"
+          hidden
+          onChange={(e) => openProjectFile(e.target.files)}
+        />
         <div className="project-name">{project.name}</div>
-        <div className="ai-status ready">AI ready · Vault: {vaultStatus.mode}</div>
+        <div className="ai-status ready">
+          {statusMsg ?? `AI ready · Vault: ${vaultStatus.mode}`}
+        </div>
       </header>
 
       <aside className="media-panel">
@@ -579,7 +659,7 @@ export function App() {
         <div className="media-list">
           {project.mediaAssets.length === 0 && (
             <p className="muted" style={{ padding: 12, lineHeight: 1.55 }}>
-              No media yet.<br />Click <strong>New</strong> then <strong>Import</strong>.
+              Import video/audio, then place on V1/V2 or A1/A2.
             </p>
           )}
           {project.mediaAssets.map((a) => (
@@ -588,12 +668,10 @@ export function App() {
               className={`media-item ${selectedAssetId === a.id ? "selected" : ""}`}
               onClick={() => setSelectedAssetId(a.id)}
               onDoubleClick={() => addAssetToTimeline(a.id)}
-              title="Double-click to place on timeline at playhead"
+              title="Double-click → place at playhead on target track"
             >
               <div className="name">{a.name}</div>
-              <div className="meta">
-                {a.type} · {formatTime(a.durationMs)}
-              </div>
+              <div className="meta">{a.type} · {formatTime(a.durationMs)}</div>
             </div>
           ))}
         </div>
@@ -610,39 +688,42 @@ export function App() {
               onChange={(e) => handleImport(e.target.files)}
             />
           </label>
-          <button
-            type="button"
-            onClick={() => {
-              stopPlayback();
-              project.mediaAssets.forEach((a) => {
-                if (a.localPathOrUrl.startsWith("blob:")) {
-                  try {
-                    URL.revokeObjectURL(a.localPathOrUrl);
-                  } catch {
-                    /* */
-                  }
-                }
-              });
-              setProject(createEmptyProject("New Resonance"));
-              setSelectedAssetId(null);
-              setSelectedClipId(null);
-              setPendingProposal(null);
-              setPlayError(null);
+          <button type="button" onClick={() => downloadProject()}>Save</button>
+        </div>
+        <div style={{ padding: "8px 12px", fontSize: 11 }}>
+          <label className="muted">Target track</label>
+          <select
+            value={defaultTargetTrack ?? ""}
+            onChange={(e) => setTargetTrackId(e.target.value)}
+            style={{
+              width: "100%",
+              marginTop: 4,
+              background: "#151a22",
+              color: "inherit",
+              border: "1px solid #333",
+              borderRadius: 4,
+              padding: 4,
             }}
           >
-            New
-          </button>
+            {project.tracks
+              .filter((t) => t.kind === "VIDEO" || t.kind === "AUDIO")
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} ({t.kind})
+                </option>
+              ))}
+          </select>
         </div>
         {selectedAssetId && (
-          <div style={{ padding: "8px 12px" }}>
+          <div style={{ padding: "0 12px 12px" }}>
             <button
               type="button"
               style={{
                 width: "100%",
                 padding: "6px",
                 borderRadius: 6,
-                border: "1px solid var(--border, #333)",
-                background: "var(--bg-elevated, #1a1f27)",
+                border: "1px solid #333",
+                background: "#1a1f27",
                 color: "inherit",
                 cursor: "pointer",
                 fontSize: 12,
@@ -672,72 +753,47 @@ export function App() {
                 background: "#000",
               }}
             />
-          ) : audioAsset ? (
-            <div className="placeholder">
-              <div style={{ fontSize: 20, marginBottom: 10 }}>♪</div>
-              <div style={{ fontSize: 15 }}>{audioAsset.name}</div>
-              <div className="muted" style={{ marginTop: 8 }}>
-                {formatTime(audioAsset.durationMs)}
-              </div>
-            </div>
           ) : (
             <div className="placeholder">
-              <div style={{ fontSize: 16, marginBottom: 8 }}>Main Output Screen</div>
-              <span className="muted">Import media to preview</span>
+              <div style={{ fontSize: 16, marginBottom: 8 }}>Main Output</div>
+              <span className="muted">
+                {hasAnyAudio ? "Audio only at playhead" : "Import & place media on V1/V2"}
+              </span>
             </div>
           )}
-          {audioAsset && (
-            <audio
-              key={audioAsset.id}
-              ref={audioRef}
-              src={audioAsset.localPathOrUrl}
-              preload="auto"
-              style={{ display: "none" }}
-            />
-          )}
+          {/* Dual audio elements for A1 / A2 */}
+          <audio
+            ref={audio1Ref}
+            src={audioAssetsForTracks[0]?.localPathOrUrl}
+            preload="auto"
+            style={{ display: "none" }}
+          />
+          <audio
+            ref={audio2Ref}
+            src={audioAssetsForTracks[1]?.localPathOrUrl}
+            preload="auto"
+            style={{ display: "none" }}
+          />
         </div>
 
         <div className="viewer-controls">
           <button type="button" onClick={togglePlay} title="Space">
             {isPlaying ? "❚❚" : "▶"}
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              stopPlayback();
-              seekTo(0);
-            }}
-            title="Stop"
-          >
-            ⏹
-          </button>
-          <button type="button" onClick={splitAtPlayhead} title="Split at playhead (C)">
-            ✂
-          </button>
+          <button type="button" onClick={() => { stopPlayback(); seekTo(0); }}>⏹</button>
+          <button type="button" onClick={splitAtPlayhead} title="C">✂</button>
           <span className="time">{formatTime(project.playheadMs)}</span>
           <div className="scrub" onClick={onTimelineClick}>
             <div className="fill" style={{ width: `${playheadPct}%` }} />
           </div>
           <span className="time">{formatTime(duration)}</span>
         </div>
-
         {playError && (
-          <div
-            style={{
-              position: "absolute",
-              bottom: 48,
-              left: 12,
-              right: 12,
-              background: "#3a1515",
-              color: "#ffb4b4",
-              padding: "8px 12px",
-              borderRadius: 6,
-              fontSize: 12,
-              zIndex: 5,
-            }}
-          >
-            {playError}
-          </div>
+          <div style={{
+            position: "absolute", bottom: 48, left: 12, right: 12,
+            background: "#3a1515", color: "#ffb4b4", padding: "8px 12px",
+            borderRadius: 6, fontSize: 12, zIndex: 5,
+          }}>{playError}</div>
         )}
       </main>
 
@@ -750,57 +806,27 @@ export function App() {
               <span className="badge pending">{pendingProposal.status}</span>
             </div>
             <div className="rationale">{pendingProposal.rationale}</div>
-            <div className="muted" style={{ fontSize: 11 }}>
-              {pendingProposal.previewDiff}
-            </div>
+            <div className="muted" style={{ fontSize: 11 }}>{pendingProposal.previewDiff}</div>
             <div className="proposal-actions">
-              <button type="button" className="btn-apply" onClick={onAccept}>
-                Apply
-              </button>
-              <button type="button" className="btn-reject" onClick={onReject}>
-                Reject
-              </button>
+              <button type="button" className="btn-apply" onClick={onAccept}>Apply</button>
+              <button type="button" className="btn-reject" onClick={onReject}>Reject</button>
             </div>
           </div>
         ) : (
-          <p className="muted" style={{ marginBottom: 16, lineHeight: 1.5 }}>
-            <strong>Shortcuts</strong>
-            <br />
-            Space = Play/Pause
-            <br />
-            C = Cut at playhead
-            <br />
-            Del = Delete selected clip
-            <br />
-            Drag clips to move
+          <p className="muted" style={{ marginBottom: 16, lineHeight: 1.55, fontSize: 12 }}>
+            <strong>Shortcuts</strong><br />
+            Space Play/Pause · C Cut · Del Delete<br />
+            Ctrl+S Save · Drag clips to move<br />
+            V2 overlays V1 at playhead (crossover)
           </p>
         )}
-
         {selectedClipId && (
           <div className="field">
             <label>Selected clip</label>
-            <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
-              {selectedClipId.slice(0, 8)}…
-            </div>
-            <button
-              type="button"
-              style={{
-                marginTop: 8,
-                padding: "4px 10px",
-                borderRadius: 4,
-                border: "1px solid #553",
-                background: "#2a1515",
-                color: "#faa",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-              onClick={deleteSelectedClip}
-            >
-              Delete clip
-            </button>
+            <button type="button" className="btn-reject" onClick={deleteSelectedClip}
+              style={{ marginTop: 6 }}>Delete clip</button>
           </div>
         )}
-
         <div className="field" style={{ marginTop: 16 }}>
           <label>Project name</label>
           <input
@@ -809,36 +835,41 @@ export function App() {
           />
         </div>
         <div className="field">
-          <label>Decisions</label>
-          <div className="muted">{project.decisions.length} (local only)</div>
+          <label>Tracks</label>
+          <div className="muted">V1 V2 · A1 A2 · crossover ready</div>
         </div>
       </aside>
 
       <section className="timeline">
         <div className="timeline-ruler" onClick={onTimelineClick} style={{ cursor: "pointer" }}>
           {[0, 0.25, 0.5, 0.75, 1].map((p) => (
-            <span
-              key={p}
-              style={{
-                position: "absolute",
-                left: `${p * 100}%`,
-                transform: "translateX(-50%)",
-                top: 4,
-                pointerEvents: "none",
-              }}
-            >
-              {formatTime(p * duration)}
-            </span>
+            <span key={p} style={{
+              position: "absolute", left: `${p * 100}%`, transform: "translateX(-50%)",
+              top: 4, pointerEvents: "none",
+            }}>{formatTime(p * duration)}</span>
           ))}
         </div>
         <div className="timeline-tracks">
-          {project.tracks.map((track) => (
+          {project.tracks.map((track, idx) => (
             <div key={track.id} className="track-row">
-              <div className={`track-label ${track.kind}`}>{track.name}</div>
+              <div
+                className={`track-label ${track.kind}`}
+                onClick={() => setTargetTrackId(track.id)}
+                style={{
+                  cursor: "pointer",
+                  outline: targetTrackId === track.id ? "1px solid #6af" : undefined,
+                }}
+                title="Click to set as target track for Place/Import"
+              >
+                {track.name}
+              </div>
               <div
                 className="track-lane"
-                ref={track.kind === "VIDEO" ? timelineLaneRef : undefined}
-                onClick={onTimelineClick}
+                ref={idx === 0 ? timelineLaneRef : undefined}
+                onClick={(e) => {
+                  setTargetTrackId(track.id);
+                  onTimelineClick(e);
+                }}
                 style={{ cursor: "pointer" }}
               >
                 {track.clips.map((clip) => {
@@ -856,14 +887,15 @@ export function App() {
                         cursor: "grab",
                         zIndex: selected ? 3 : 1,
                       }}
-                      title={`${clip.label || track.kind} — drag to move`}
+                      title={`${clip.label} — drag to move`}
                       onPointerDown={(e) => onClipPointerDown(e, clip)}
                       onClick={(e) => {
                         e.stopPropagation();
                         setSelectedClipId(clip.id);
+                        setTargetTrackId(track.id);
                       }}
                     >
-                      {clip.label || track.kind}
+                      {clip.label || track.name}
                     </div>
                   );
                 })}

@@ -1,5 +1,5 @@
 /**
- * AILEXSI Resonance Studio — Core domain models (V0.1)
+ * AILEXSI Resonance Studio — Core domain models (V0.1.1)
  * Local-first, data-first. Analysis is always honest (never fake capabilities).
  */
 
@@ -10,7 +10,6 @@ export type TrackKind =
   | "LYRICS"
   | "BEATS"
   | "AI_EVENTS";
-// future: FACE | LIP | CAMERA | MOTION | SFX | SEMANTIC | ENERGY
 
 export interface TimeRange {
   startMs: number;
@@ -109,6 +108,7 @@ export interface Project {
   vaultRefs?: string[];
 }
 
+/** V0.1.1: two video + two audio lanes for crossover cuts */
 export function createEmptyProject(name = "Untitled Resonance"): Project {
   const now = new Date().toISOString();
   return {
@@ -118,8 +118,10 @@ export function createEmptyProject(name = "Untitled Resonance"): Project {
     updatedAt: now,
     mediaAssets: [],
     tracks: [
-      { id: crypto.randomUUID(), kind: "VIDEO", name: "Video", clips: [] },
-      { id: crypto.randomUUID(), kind: "AUDIO", name: "Audio", clips: [] },
+      { id: crypto.randomUUID(), kind: "VIDEO", name: "V1", clips: [] },
+      { id: crypto.randomUUID(), kind: "VIDEO", name: "V2", clips: [] },
+      { id: crypto.randomUUID(), kind: "AUDIO", name: "A1", clips: [] },
+      { id: crypto.randomUUID(), kind: "AUDIO", name: "A2", clips: [] },
       { id: crypto.randomUUID(), kind: "BEATS", name: "Beats", clips: [] },
       { id: crypto.randomUUID(), kind: "AI_EVENTS", name: "AI Events", clips: [] },
     ],
@@ -129,5 +131,34 @@ export function createEmptyProject(name = "Untitled Resonance"): Project {
     proposals: [],
     decisions: [],
     vaultRefs: [],
+  };
+}
+
+/** Migrate older single-track projects to multi-track layout */
+export function ensureMultiTrack(project: Project): Project {
+  const videoTracks = project.tracks.filter((t) => t.kind === "VIDEO");
+  const audioTracks = project.tracks.filter((t) => t.kind === "AUDIO");
+  if (videoTracks.length >= 2 && audioTracks.length >= 2) return project;
+
+  const empty = createEmptyProject(project.name);
+  const v1 = empty.tracks.find((t) => t.name === "V1")!;
+  const a1 = empty.tracks.find((t) => t.name === "A1")!;
+
+  const migratedVideos =
+    videoTracks[0]?.clips.map((c) => ({ ...c, trackId: v1.id })) ?? [];
+  const migratedAudios =
+    audioTracks[0]?.clips.map((c) => ({ ...c, trackId: a1.id })) ?? [];
+
+  return {
+    ...project,
+    tracks: empty.tracks.map((t) => {
+      if (t.name === "V1") return { ...t, clips: migratedVideos };
+      if (t.name === "A1") return { ...t, clips: migratedAudios };
+      if (t.kind === "BEATS" || t.kind === "AI_EVENTS") {
+        const old = project.tracks.find((x) => x.kind === t.kind);
+        return old ? { ...t, clips: old.clips.map((c) => ({ ...c, trackId: t.id })) } : t;
+      }
+      return t;
+    }),
   };
 }

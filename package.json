@@ -1,9 +1,9 @@
 {
   "name": "@ailexsi/resonance-studio",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "AILEXSI Resonance Studio — local-first creative product. Consumes ailexsi-core-vault-v2 as immutable foundation.",
+  "description": "AILEXSI Resonance Studio \u2014 local-first creative product. Consumes ailexsi-core-vault-v2 as immutable foundation.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
